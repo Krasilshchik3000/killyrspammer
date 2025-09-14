@@ -383,8 +383,8 @@ async def send_suspicious_message_to_admin(message: types.Message, result: SpamR
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="❌ СПАМ", callback_data=f"spam_{message.message_id}"),
-            InlineKeyboardButton(text="✅ НЕ СПАМ", callback_data=f"not_spam_{message.message_id}")
+            InlineKeyboardButton(text="🔴 СПАМ", callback_data=f"spam_{message.message_id}"),
+            InlineKeyboardButton(text="🟢 НЕ СПАМ", callback_data=f"not_spam_{message.message_id}")
         ]
     ])
     
@@ -406,7 +406,12 @@ async def send_suspicious_message_to_admin(message: types.Message, result: SpamR
 
 async def analyze_bot_error(message_text: str, error_type: str):
     """Анализ ошибки бота через ChatGPT"""
+    if not openai_client:
+        logger.error("❌ OpenAI клиент не инициализирован")
+        return None, None
+        
     current_prompt = get_current_prompt()
+    logger.info(f"🧠 Анализирую ошибку типа '{error_type}' для сообщения: '{message_text[:50]}...'")
     
     if error_type == "missed_spam":
         analysis_prompt = f"""У тебя есть промпт, по которому ты определяешь спам в Telegram. Вот он:
@@ -790,8 +795,17 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
         logger.warning(f"⚠️ Неавторизованный доступ к кнопке от {callback.from_user.id}")
         return
     
-    action, message_id = callback.data.split("_", 1)
-    message_id = int(message_id)
+    if callback.data.startswith("not_spam_"):
+        action = "not_spam"
+        message_id = int(callback.data.replace("not_spam_", ""))
+    elif callback.data.startswith("spam_"):
+        action = "spam"
+        message_id = int(callback.data.replace("spam_", ""))
+    else:
+        await callback.answer("❌ Неизвестная команда")
+        return
+    
+    logger.info(f"🔍 Обработка кнопки: action={action}, message_id={message_id}")
     
     # Получаем текст сообщения и результат LLM из БД
     try:
@@ -825,14 +839,23 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
     await callback.message.edit_text(new_text, parse_mode='HTML')
     
     # Проверяем, была ли это ошибка бота
+    logger.info(f"🔍 Проверяю ошибку: action={action}, llm_result={llm_result}")
+    
     if (action == "not_spam" and llm_result in ['СПАМ', 'ВОЗМОЖНО_СПАМ']) or (action == "spam" and llm_result == 'НЕ_СПАМ'):
+        logger.info(f"🚨 Обнаружена ошибка бота! Запускаю анализ...")
         await callback.answer(f"✅ Отмечено как {decision}. Анализирую ошибку бота...")
         
         # Определяем тип ошибки
         error_type = "false_positive" if action == "not_spam" else "missed_spam"
+        logger.info(f"📊 Тип ошибки: {error_type}")
         
         # Анализируем ошибку через ChatGPT
-        analysis, improved_prompt = await analyze_bot_error(message_text, error_type)
+        try:
+            analysis, improved_prompt = await analyze_bot_error(message_text, error_type)
+            logger.info(f"🧠 Результат анализа: analysis={analysis is not None}, prompt={improved_prompt is not None}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка в analyze_bot_error: {e}")
+            analysis, improved_prompt = None, None
         
         if improved_prompt:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -858,9 +881,12 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
 <code>{improved_prompt}</code>"""
             
             await bot.send_message(ADMIN_ID, prompt_message, reply_markup=keyboard, parse_mode='HTML')
+            logger.info("✅ Анализ ошибки отправлен админу")
         else:
-            await bot.send_message(ADMIN_ID, "❌ Не удалось проанализировать ошибку автоматически")
+            logger.warning("⚠️ Не удалось получить улучшенный промпт")
+            await bot.send_message(ADMIN_ID, f"❌ Не удалось проанализировать ошибку автоматически\n\nСообщение: '{message_text}'\nОшибка: {error_type}")
     else:
+        logger.info(f"ℹ️ Не ошибка бота: action={action}, llm_result={llm_result}")
         await callback.answer(f"✅ Отмечено как {decision}")
 
 @dp.callback_query(F.data.in_(["apply_prompt", "edit_prompt", "reject_prompt", "edit_current_prompt"]))
