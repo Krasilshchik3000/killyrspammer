@@ -204,11 +204,28 @@ def parse_llm_response(response_text: str) -> SpamResult:
     """Парсинг ответа от LLM"""
     cleaned = re.sub(r'[^\w\s_]', '', response_text.strip().upper())
     
-    # Проверяем в правильном порядке - сначала более специфичные варианты
-    maybe_spam_keywords = ['ВОЗМОЖНО_СПАМ', 'ВОЗМОЖНО СПАМ', 'ВОЗМОЖНОСПАМ', 'MAYBE_SPAM', 'MAYBE SPAM', 'MAYBEСПАМ']
-    not_spam_keywords = ['НЕ_СПАМ', 'НЕ СПАМ', 'НЕСПАМ', 'NOT_SPAM', 'NOT SPAM', 'NOTSPAM']
+    # Добавляем обработку обрезанных ответов
+    maybe_spam_keywords = [
+        'ВОЗМОЖНО_СПАМ', 'ВОЗМОЖНО СПАМ', 'ВОЗМОЖНОСПАМ', 
+        'MAYBE_SPAM', 'MAYBE SPAM', 'MAYBEСПАМ',
+        'ВОЗМО', 'ВОЗМОЖ'  # Обрезанные варианты
+    ]
+    not_spam_keywords = [
+        'НЕ_СПАМ', 'НЕ СПАМ', 'НЕСПАМ', 
+        'NOT_SPAM', 'NOT SPAM', 'NOTSPAM',
+        'НЕ_СП', 'НЕ_С'  # Обрезанные варианты
+    ]
     spam_keywords = ['СПАМ', 'SPAM']
     
+    # Проверяем точные совпадения сначала
+    if cleaned in ['СПАМ', 'SPAM']:
+        return SpamResult.SPAM
+    elif cleaned in ['НЕ_СПАМ', 'НЕ СПАМ', 'НЕСПАМ', 'NOT_SPAM', 'NOT SPAM', 'NOTSPAM']:
+        return SpamResult.NOT_SPAM
+    elif cleaned in ['ВОЗМОЖНО_СПАМ', 'ВОЗМОЖНО СПАМ', 'ВОЗМОЖНОСПАМ', 'MAYBE_SPAM', 'MAYBE SPAM']:
+        return SpamResult.MAYBE_SPAM
+    
+    # Проверяем частичные совпадения
     if any(keyword in cleaned for keyword in maybe_spam_keywords):
         return SpamResult.MAYBE_SPAM
     elif any(keyword in cleaned for keyword in not_spam_keywords):
@@ -216,7 +233,7 @@ def parse_llm_response(response_text: str) -> SpamResult:
     elif any(keyword in cleaned for keyword in spam_keywords):
         return SpamResult.SPAM
     
-    logger.warning(f"Не удалось распарсить ответ LLM: '{response_text}'")
+    logger.warning(f"Не удалось распарсить ответ LLM: '{response_text}' (очищенный: '{cleaned}')")
     return SpamResult.MAYBE_SPAM
 
 async def improve_prompt_with_ai(mistakes):
@@ -264,11 +281,14 @@ async def check_message_with_llm(message_text: str) -> SpamResult:
     current_prompt = get_current_prompt()
     prompt = current_prompt.format(message_text=message_text)
     
+    logger.info(f"🤖 Отправляю в ChatGPT: '{message_text[:50]}...'")
+    logger.debug(f"📝 Полный промпт: {prompt}")
+    
     try:
         response = await openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=5,
+            max_tokens=20,  # Увеличиваем лимит токенов
             temperature=0,
             timeout=10
         )
@@ -276,11 +296,16 @@ async def check_message_with_llm(message_text: str) -> SpamResult:
         llm_answer = response.choices[0].message.content.strip()
         result = parse_llm_response(llm_answer)
         
-        logger.info(f"LLM ответ: '{llm_answer}' → {result.value}")
+        logger.info(f"🎯 ChatGPT ответил: '{llm_answer}' (длина: {len(llm_answer)}) → {result.value}")
+        
+        # Если ответ слишком короткий, это подозрительно
+        if len(llm_answer) < 3:
+            logger.warning(f"⚠️ Подозрительно короткий ответ от ChatGPT: '{llm_answer}'")
+        
         return result
         
     except Exception as e:
-        logger.error(f"Ошибка LLM: {e}")
+        logger.error(f"❌ Ошибка LLM: {e}")
         return SpamResult.MAYBE_SPAM
 
 async def send_suspicious_message_to_admin(message: types.Message, result: SpamResult):
