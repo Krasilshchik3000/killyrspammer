@@ -15,16 +15,14 @@ from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_ID, ALLOWED_GROUP_IDS
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Инициализация бота
-bot = Bot(token=BOT_TOKEN)
+# Глобальные переменные
+bot = None
 dp = Dispatcher()
-
-# Настройка OpenAI
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # Глобальная переменная для хранения предложенного промпта
 pending_prompt = None
 awaiting_prompt_edit = False
+openai_client = None
 
 class SpamResult(Enum):
     SPAM = "СПАМ"
@@ -673,6 +671,8 @@ async def handle_prompt_management(callback: types.CallbackQuery):
 
 async def main():
     """Запуск бота"""
+    global openai_client, bot
+    
     # Проверяем наличие необходимых переменных окружения
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN не найден в переменных окружения!")
@@ -684,6 +684,22 @@ async def main():
     
     if ADMIN_ID == 0:
         logger.error("❌ ADMIN_ID не найден в переменных окружения!")
+        return
+    
+    # Инициализация бота
+    try:
+        bot = Bot(token=BOT_TOKEN)
+        logger.info("✅ Telegram бот инициализирован")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации Telegram бота: {e}")
+        return
+    
+    # Инициализация OpenAI клиента
+    try:
+        openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        logger.info("✅ OpenAI клиент инициализирован")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации OpenAI: {e}")
         return
     
     # Инициализация БД
