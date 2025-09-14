@@ -304,14 +304,19 @@ async def send_suspicious_message_to_admin(message: types.Message, result: SpamR
     ])
     
     try:
-        await bot.send_message(
+        logger.info(f"📤 Отправляю подозрительное сообщение админу {ADMIN_ID}")
+        logger.info(f"🔘 Кнопки: spam_{message.message_id}, not_spam_{message.message_id}")
+        
+        sent_message = await bot.send_message(
             ADMIN_ID, 
             admin_text, 
             reply_markup=keyboard,
             parse_mode='HTML'
         )
+        logger.info(f"✅ Сообщение отправлено админу (ID: {sent_message.message_id})")
+        
     except Exception as e:
-        logger.error(f"Ошибка отправки админу: {e}")
+        logger.error(f"❌ Ошибка отправки админу: {e}")
 
 
 @dp.message(F.content_type == 'text', F.forward_from)
@@ -605,8 +610,11 @@ async def handle_message(message: types.Message):
 @dp.callback_query(F.data.startswith("spam_") | F.data.startswith("not_spam_"))
 async def handle_admin_feedback(callback: types.CallbackQuery):
     """Обработка обратной связи от администратора"""
+    logger.info(f"🔘 Нажата кнопка: {callback.data} от пользователя {callback.from_user.id}")
+    
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("❌ Только для администратора")
+        logger.warning(f"⚠️ Неавторизованный доступ к кнопке от {callback.from_user.id}")
         return
     
     action, message_id = callback.data.split("_", 1)

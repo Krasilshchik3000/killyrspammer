@@ -24,7 +24,8 @@ ALLOWED_GROUP_IDS = [
 ]
 
 # Настройки базы данных
-DATABASE_PATH = "antispam.db"
+DATABASE_URL = os.getenv("DATABASE_URL")  # Для Railway PostgreSQL
+DATABASE_PATH = os.getenv("DATABASE_PATH", "antispam.db")  # Локальная SQLite
 
 # Настройки LLM
 LLM_MODEL = "gpt-3.5-turbo"
