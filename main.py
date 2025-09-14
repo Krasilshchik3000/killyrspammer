@@ -404,6 +404,61 @@ async def send_suspicious_message_to_admin(message: types.Message, result: SpamR
         logger.error(f"❌ Ошибка отправки админу: {e}")
 
 
+async def analyze_bot_error(message_text: str, error_type: str):
+    """Анализ ошибки бота через ChatGPT"""
+    current_prompt = get_current_prompt()
+    
+    if error_type == "missed_spam":
+        analysis_prompt = f"""У тебя есть промпт, по которому ты определяешь спам в Telegram. Вот он:
+
+{current_prompt}
+
+Но это сообщение ты НЕ определил как спам, хотя это спам:
+"{message_text}"
+
+Почему ты не определил это как спам? Ответь кратко и предложи улучшенный промпт, который поможет в следующий раз правильно определить такие сообщения как спам.
+
+Ответь в формате:
+АНАЛИЗ: [причина ошибки]
+УЛУЧШЕННЫЙ_ПРОМПТ: [новый промпт]"""
+
+    else:  # false_positive
+        analysis_prompt = f"""У тебя есть промпт, по которому ты определяешь спам в Telegram. Вот он:
+
+{current_prompt}
+
+Но это сообщение ты определил как спам, хотя это НЕ спам:
+"{message_text}"
+
+Почему ты определил это как спам? Ответь кратко и предложи улучшенный промпт, который поможет в следующий раз НЕ считать такие сообщения спамом.
+
+Ответь в формате:
+АНАЛИЗ: [причина ошибки]
+УЛУЧШЕННЫЙ_ПРОМПТ: [новый промпт]"""
+
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": analysis_prompt}],
+            max_tokens=1500,
+            temperature=0.3,
+            timeout=30
+        )
+        
+        analysis = response.choices[0].message.content.strip()
+        logger.info(f"🧠 ChatGPT проанализировал ошибку: {analysis[:100]}...")
+        
+        # Извлекаем улучшенный промпт
+        if "УЛУЧШЕННЫЙ_ПРОМПТ:" in analysis:
+            improved_prompt = analysis.split("УЛУЧШЕННЫЙ_ПРОМПТ:")[1].strip()
+            return analysis, improved_prompt
+        
+        return analysis, None
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка анализа: {e}")
+        return None, None
+
 @dp.message(F.content_type == 'text', F.forward_from)
 async def handle_forwarded_spam(message: types.Message):
     """Обработка пересланных сообщений как примеров спама (ошибки бота)"""
@@ -413,37 +468,36 @@ async def handle_forwarded_spam(message: types.Message):
     # Добавляем как пример спама
     add_training_example(message.text, True, 'FORWARDED_MISTAKE')
     
-    # Проверяем, нужно ли улучшить промпт
-    mistakes = get_recent_mistakes(5)
-    if len(mistakes) >= 1:  # После каждой ошибки
-        await message.reply("🔄 Анализирую ошибки и улучшаю промпт...")
+    await message.reply("🔄 Анализирую, почему бот пропустил этот спам...")
+    
+    # Анализируем ошибку через ChatGPT
+    analysis, improved_prompt = await analyze_bot_error(message.text, "missed_spam")
+    
+    if improved_prompt:
+        # Отправляем админу предложение по улучшению
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Применить", callback_data="apply_prompt"),
+                InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_prompt"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data="reject_prompt")
+            ]
+        ])
         
-        improved_prompt = await improve_prompt_with_ai(mistakes)
-        if improved_prompt:
-            # Отправляем админу предложение по улучшению
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Применить", callback_data="apply_prompt"),
-                    InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_prompt"),
-                    InlineKeyboardButton(text="❌ Отклонить", callback_data="reject_prompt")
-                ]
-            ])
-            
-            prompt_message = f"""🤖 <b>Предлагаю улучшенный промпт:</b>
+        prompt_message = f"""🤖 <b>Анализ ошибки и улучшенный промпт:</b>
 
-<code>{improved_prompt}</code>
+{analysis}
 
-<b>Основание:</b> Анализ последних {len(mistakes)} ошибок"""
-            
-            # Сохраняем предложенный промпт во временную переменную
-            global pending_prompt
-            pending_prompt = improved_prompt
-            
-            await bot.send_message(ADMIN_ID, prompt_message, reply_markup=keyboard, parse_mode='HTML')
-        else:
-            await message.reply("❌ Не удалось улучшить промпт автоматически")
+<b>Пропущенное сообщение:</b> "{message.text}"
+
+<code>{improved_prompt}</code>"""
+        
+        # Сохраняем предложенный промпт
+        global pending_prompt
+        pending_prompt = improved_prompt
+        
+        await bot.send_message(ADMIN_ID, prompt_message, reply_markup=keyboard, parse_mode='HTML')
     else:
-        await message.reply(f"✅ Добавил в базу спама. Ошибок: {len(mistakes)} - анализирую для улучшения промпта")
+        await message.reply("❌ Не удалось проанализировать ошибку автоматически")
 
 # ВАЖНО: Обработчики команд должны быть ПЕРЕД общим обработчиком текста!
 
@@ -739,14 +793,14 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
     action, message_id = callback.data.split("_", 1)
     message_id = int(message_id)
     
-    # Получаем текст сообщения из БД
+    # Получаем текст сообщения и результат LLM из БД
     try:
         from database import execute_query
-        result = execute_query("SELECT text FROM messages WHERE message_id = ?", (message_id,), fetch='one')
+        result = execute_query("SELECT text, llm_result FROM messages WHERE message_id = ?", (message_id,), fetch='one')
     except:
         conn = sqlite3.connect('antispam.db')
         cursor = conn.cursor()
-        cursor.execute("SELECT text FROM messages WHERE message_id = ?", (message_id,))
+        cursor.execute("SELECT text, llm_result FROM messages WHERE message_id = ?", (message_id,))
         result = cursor.fetchone()
         conn.close()
     
@@ -754,7 +808,7 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
         await callback.answer("❌ Сообщение не найдено")
         return
     
-    message_text = result[0]
+    message_text, llm_result = result
     decision = "СПАМ" if action == "spam" else "НЕ_СПАМ"
     is_spam = (action == "spam")
     
@@ -770,13 +824,16 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
     
     await callback.message.edit_text(new_text, parse_mode='HTML')
     
-    # Проверяем, нужно ли улучшить промпт (если это была ошибка бота)
-    mistakes = get_recent_mistakes(5)
-    if len(mistakes) >= 1:
-        await callback.answer(f"✅ Отмечено как {decision}. Обнаружена ошибка - предлагаю улучшить промпт!")
+    # Проверяем, была ли это ошибка бота
+    if (action == "not_spam" and llm_result in ['СПАМ', 'ВОЗМОЖНО_СПАМ']) or (action == "spam" and llm_result == 'НЕ_СПАМ'):
+        await callback.answer(f"✅ Отмечено как {decision}. Анализирую ошибку бота...")
         
-        # Запускаем улучшение промпта
-        improved_prompt = await improve_prompt_with_ai(mistakes)
+        # Определяем тип ошибки
+        error_type = "false_positive" if action == "not_spam" else "missed_spam"
+        
+        # Анализируем ошибку через ChatGPT
+        analysis, improved_prompt = await analyze_bot_error(message_text, error_type)
+        
         if improved_prompt:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [
@@ -789,13 +846,20 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
             global pending_prompt
             pending_prompt = improved_prompt
             
-            prompt_message = f"""🤖 <b>Предлагаю улучшенный промпт:</b>
+            error_description = "ложно определил как спам" if error_type == "false_positive" else "пропустил спам"
+            
+            prompt_message = f"""🤖 <b>Анализ ошибки бота:</b>
 
-<code>{improved_prompt}</code>
+<b>Ошибка:</b> Бот {error_description}
+<b>Сообщение:</b> "{message_text}"
 
-<b>Основание:</b> Анализ последних {len(mistakes)} ошибок"""
+{analysis}
+
+<code>{improved_prompt}</code>"""
             
             await bot.send_message(ADMIN_ID, prompt_message, reply_markup=keyboard, parse_mode='HTML')
+        else:
+            await bot.send_message(ADMIN_ID, "❌ Не удалось проанализировать ошибку автоматически")
     else:
         await callback.answer(f"✅ Отмечено как {decision}")
 
