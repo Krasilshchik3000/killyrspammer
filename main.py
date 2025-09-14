@@ -612,14 +612,20 @@ async def cancel_command(message: types.Message):
         await message.reply("ℹ️ Нет активного редактирования")
 
 
-@dp.message(F.text & F.from_user.id == ADMIN_ID & (F.chat.type == "private"))
+@dp.message(F.text & (F.chat.type == "private"))
 async def handle_admin_text(message: types.Message):
     """Обработка текстовых сообщений от админа в ЛИЧКЕ (только для редактирования промпта в режиме ожидания)"""
     global awaiting_prompt_edit, pending_prompt
     
+    # Проверяем, что это админ
+    if message.from_user.id != ADMIN_ID:
+        return
+    
     # Пропускаем команды - они должны обрабатываться другими хендлерами
     if message.text and message.text.startswith('/'):
         return
+    
+    logger.info(f"🔍 handle_admin_text вызван с сообщением: '{message.text[:50]}...'")
     
     # Загружаем состояние из БД
     from database import get_bot_state, set_bot_state

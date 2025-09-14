@@ -13,11 +13,19 @@ def get_db_connection():
     """Получить подключение к базе данных"""
     if DATABASE_URL:
         # PostgreSQL для Railway
-        import psycopg2
-        return psycopg2.connect(DATABASE_URL)
+        try:
+            import psycopg2
+            conn = psycopg2.connect(DATABASE_URL)
+            logger.info("✅ Подключение к PostgreSQL установлено")
+            return conn
+        except Exception as e:
+            logger.error(f"❌ Ошибка подключения к PostgreSQL: {e}")
+            raise
     else:
         # SQLite для локальной разработки
-        return sqlite3.connect(DATABASE_PATH)
+        conn = sqlite3.connect(DATABASE_PATH)
+        logger.info("✅ Подключение к SQLite установлено")
+        return conn
 
 def init_database():
     """Инициализация базы данных"""
