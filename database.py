@@ -65,6 +65,17 @@ def init_database():
             )
         ''')
         
+        # Таблица состояний бота
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_state (
+                id SERIAL PRIMARY KEY,
+                admin_id BIGINT,
+                awaiting_prompt_edit BOOLEAN DEFAULT FALSE,
+                pending_prompt TEXT,
+                updated_at TIMESTAMP
+            )
+        ''')
+        
         # Вставляем базовый промпт, если таблица пустая
         cursor.execute("SELECT COUNT(*) FROM prompts")
         if cursor.fetchone()[0] == 0:
@@ -127,6 +138,17 @@ def init_database():
             )
         ''')
         
+        # Таблица состояний бота
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER,
+                awaiting_prompt_edit BOOLEAN DEFAULT FALSE,
+                pending_prompt TEXT,
+                updated_at TIMESTAMP
+            )
+        ''')
+        
         # Вставляем базовый промпт, если таблица пустая
         cursor.execute("SELECT COUNT(*) FROM prompts")
         if cursor.fetchone()[0] == 0:
@@ -180,3 +202,35 @@ def execute_query(query, params=None, fetch=False):
         logger.error(f"📝 Запрос: {query}")
         logger.error(f"📝 Параметры: {params}")
         raise
+
+def set_bot_state(admin_id, awaiting_prompt_edit=False, pending_prompt=None):
+    """Сохранить состояние бота"""
+    try:
+        # Удаляем старое состояние для этого админа
+        execute_query("DELETE FROM bot_state WHERE admin_id = ?", (admin_id,))
+        
+        # Добавляем новое состояние
+        execute_query('''
+            INSERT INTO bot_state (admin_id, awaiting_prompt_edit, pending_prompt, updated_at)
+            VALUES (?, ?, ?, ?)
+        ''', (admin_id, awaiting_prompt_edit, pending_prompt, datetime.now()))
+        
+        logger.info(f"💾 Состояние бота сохранено: awaiting_prompt_edit={awaiting_prompt_edit}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения состояния: {e}")
+
+def get_bot_state(admin_id):
+    """Получить состояние бота"""
+    try:
+        result = execute_query(
+            "SELECT awaiting_prompt_edit, pending_prompt FROM bot_state WHERE admin_id = ? ORDER BY updated_at DESC LIMIT 1",
+            (admin_id,), fetch='one'
+        )
+        if result:
+            awaiting_edit, pending = result
+            logger.info(f"📖 Загружено состояние: awaiting_prompt_edit={awaiting_edit}")
+            return awaiting_edit, pending
+        return False, None
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения состояния: {e}")
+        return False, None

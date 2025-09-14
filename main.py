@@ -559,9 +559,13 @@ async def edit_prompt_command(message: types.Message):
         await message.reply("❌ Команда только для администратора")
         return
     
+    # Сохраняем состояние в БД вместо глобальной переменной
+    from database import set_bot_state
+    set_bot_state(ADMIN_ID, awaiting_prompt_edit=True)
+    
     global awaiting_prompt_edit
     awaiting_prompt_edit = True
-    logger.info(f"Установлен режим редактирования: awaiting_prompt_edit = {awaiting_prompt_edit}")
+    logger.info(f"Установлен режим редактирования в БД и памяти")
     
     current_prompt = get_current_prompt()
     edit_message = f"""✏️ <b>Редактирование промпта</b>
@@ -617,8 +621,17 @@ async def handle_admin_text(message: types.Message):
     if message.text and message.text.startswith('/'):
         return
     
+    # Загружаем состояние из БД
+    from database import get_bot_state, set_bot_state
+    db_awaiting_edit, db_pending_prompt = get_bot_state(ADMIN_ID)
+    
+    # Синхронизируем с глобальной переменной
+    awaiting_prompt_edit = db_awaiting_edit
+    pending_prompt = db_pending_prompt
+    
+    logger.info(f"handle_admin_text: состояние из БД awaiting_prompt_edit = {awaiting_prompt_edit}")
+    
     # Обрабатываем ТОЛЬКО если находимся в режиме редактирования промпта
-    logger.info(f"handle_admin_text (ЛИЧКА): awaiting_prompt_edit = {awaiting_prompt_edit}")
     if awaiting_prompt_edit:
         
         # Проверяем базовую структуру промпта
@@ -634,6 +647,9 @@ async def handle_admin_text(message: types.Message):
         # Сохраняем новый промпт
         logger.info(f"💾 Сохраняю новый промпт от админа (длина: {len(message.text)} символов)")
         save_new_prompt(message.text, "Ручное редактирование администратором")
+        
+        # Сбрасываем состояние в БД
+        set_bot_state(ADMIN_ID, awaiting_prompt_edit=False)
         awaiting_prompt_edit = False
         pending_prompt = None
         
