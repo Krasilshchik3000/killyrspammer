@@ -179,15 +179,25 @@ def get_current_prompt():
     try:
         from database import execute_query
         result = execute_query("SELECT prompt_text FROM prompts WHERE is_active = TRUE ORDER BY version DESC LIMIT 1", fetch='one')
-        return result[0] if result else SPAM_CHECK_PROMPT
-    except:
-        # Fallback к SQLite
-        conn = sqlite3.connect('antispam.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT prompt_text FROM prompts WHERE is_active = TRUE ORDER BY version DESC LIMIT 1")
-        result = cursor.fetchone()
-        conn.close()
-        return result[0] if result else SPAM_CHECK_PROMPT
+        prompt = result[0] if result else SPAM_CHECK_PROMPT
+        logger.info(f"📖 Загружен промпт из БД: {prompt[200:300]}...")  # Показываем середину для отладки
+        return prompt
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки промпта из основной БД: {e}")
+        # Fallback к SQLite только в крайнем случае
+        try:
+            conn = sqlite3.connect('antispam.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT prompt_text FROM prompts WHERE is_active = TRUE ORDER BY version DESC LIMIT 1")
+            result = cursor.fetchone()
+            conn.close()
+            prompt = result[0] if result else SPAM_CHECK_PROMPT
+            logger.warning(f"⚠️ Использую fallback SQLite промпт: {prompt[200:300]}...")
+            return prompt
+        except Exception as e2:
+            logger.error(f"❌ Ошибка fallback: {e2}")
+            logger.info("📝 Использую базовый промпт")
+            return SPAM_CHECK_PROMPT
 
 def save_new_prompt(prompt_text: str, reason: str):
     """Сохранить новый промпт"""
