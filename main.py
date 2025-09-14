@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -837,4 +838,11 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    # Предупреждение о локальном запуске
+    if not os.getenv("RAILWAY_ENVIRONMENT"):
+        print("⚠️  ВНИМАНИЕ: Локальный запуск может привести к конфликтам с Railway ботом!")
+        print("🚀 Рекомендуется использовать только Railway для продакшена.")
+        print("🛑 Для остановки нажмите Ctrl+C")
+        print("=" * 60)
+    
     asyncio.run(main())
