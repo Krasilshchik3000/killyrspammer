@@ -99,52 +99,80 @@ def init_database():
 
 def save_message_to_db(message: types.Message, llm_result: SpamResult = None):
     """Сохранение сообщения в базу данных"""
-    conn = sqlite3.connect('antispam.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        INSERT OR REPLACE INTO messages 
-        (message_id, chat_id, user_id, username, text, created_at, llm_result)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        message.message_id,
-        message.chat.id,
-        message.from_user.id,
-        message.from_user.username or '',
-        message.text,
-        datetime.now(),
-        llm_result.value if llm_result else None
-    ))
-    
-    conn.commit()
-    conn.close()
+    try:
+        from database import execute_query
+        execute_query('''
+            INSERT INTO messages 
+            (message_id, chat_id, user_id, username, text, created_at, llm_result)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (message_id) DO UPDATE SET
+            llm_result = EXCLUDED.llm_result
+        ''', (
+            message.message_id,
+            message.chat.id,
+            message.from_user.id,
+            message.from_user.username or '',
+            message.text,
+            datetime.now(),
+            llm_result.value if llm_result else None
+        ))
+    except:
+        # Fallback к SQLite
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO messages 
+            (message_id, chat_id, user_id, username, text, created_at, llm_result)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            message.message_id,
+            message.chat.id,
+            message.from_user.id,
+            message.from_user.username or '',
+            message.text,
+            datetime.now(),
+            llm_result.value if llm_result else None
+        ))
+        conn.commit()
+        conn.close()
 
 def update_admin_decision(message_id: int, decision: str):
     """Обновление решения администратора"""
-    conn = sqlite3.connect('antispam.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        UPDATE messages 
-        SET admin_decision = ?, admin_decided_at = ?
-        WHERE message_id = ?
-    ''', (decision, datetime.now(), message_id))
-    
-    conn.commit()
-    conn.close()
+    try:
+        from database import execute_query
+        execute_query('''
+            UPDATE messages 
+            SET admin_decision = ?, admin_decided_at = ?
+            WHERE message_id = ?
+        ''', (decision, datetime.now(), message_id))
+    except:
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE messages 
+            SET admin_decision = ?, admin_decided_at = ?
+            WHERE message_id = ?
+        ''', (decision, datetime.now(), message_id))
+        conn.commit()
+        conn.close()
 
 def add_training_example(text: str, is_spam: bool, source: str):
     """Добавление примера для обучения"""
-    conn = sqlite3.connect('antispam.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        INSERT INTO training_examples (text, is_spam, source, created_at)
-        VALUES (?, ?, ?, ?)
-    ''', (text, is_spam, source, datetime.now()))
-    
-    conn.commit()
-    conn.close()
+    try:
+        from database import execute_query
+        execute_query('''
+            INSERT INTO training_examples (text, is_spam, source, created_at)
+            VALUES (?, ?, ?, ?)
+        ''', (text, is_spam, source, datetime.now()))
+    except:
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO training_examples (text, is_spam, source, created_at)
+            VALUES (?, ?, ?, ?)
+        ''', (text, is_spam, source, datetime.now()))
+        conn.commit()
+        conn.close()
 
 def get_current_prompt():
     """Получить текущий активный промпт"""
@@ -204,24 +232,33 @@ def save_new_prompt(prompt_text: str, reason: str):
 
 def get_recent_mistakes(limit=10):
     """Получить недавние ошибки бота для улучшения промпта"""
-    conn = sqlite3.connect('antispam.db')
-    cursor = conn.cursor()
-    
-    # Получаем примеры где бот ошибся
-    cursor.execute('''
-        SELECT text, llm_result, admin_decision, created_at
-        FROM messages 
-        WHERE admin_decision IS NOT NULL 
-        AND ((llm_result = 'НЕ_СПАМ' AND admin_decision = 'СПАМ') 
-             OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'НЕ_СПАМ'))
-        ORDER BY admin_decided_at DESC 
-        LIMIT ?
-    ''', (limit,))
-    
-    mistakes = cursor.fetchall()
-    conn.close()
-    
-    return mistakes
+    try:
+        from database import execute_query
+        mistakes = execute_query('''
+            SELECT text, llm_result, admin_decision, created_at
+            FROM messages 
+            WHERE admin_decision IS NOT NULL 
+            AND ((llm_result = 'НЕ_СПАМ' AND admin_decision = 'СПАМ') 
+                 OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'НЕ_СПАМ'))
+            ORDER BY admin_decided_at DESC 
+            LIMIT ?
+        ''', (limit,), fetch='all')
+        return mistakes or []
+    except:
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT text, llm_result, admin_decision, created_at
+            FROM messages 
+            WHERE admin_decision IS NOT NULL 
+            AND ((llm_result = 'НЕ_СПАМ' AND admin_decision = 'СПАМ') 
+                 OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'НЕ_СПАМ'))
+            ORDER BY admin_decided_at DESC 
+            LIMIT ?
+        ''', (limit,))
+        mistakes = cursor.fetchall()
+        conn.close()
+        return mistakes
 
 def parse_llm_response(response_text: str) -> SpamResult:
     """Парсинг ответа от LLM"""
@@ -475,26 +512,33 @@ async def stats_command(message: types.Message):
         await message.reply("❌ Команда только для администратора")
         return
         
-    conn = sqlite3.connect('antispam.db')
-    cursor = conn.cursor()
-    
-    # Общая статистика
-    cursor.execute("SELECT COUNT(*) FROM messages")
-    total_messages = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM messages WHERE llm_result = 'СПАМ'")
-    spam_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM messages WHERE llm_result = 'ВОЗМОЖНО_СПАМ'")
-    maybe_spam_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM messages WHERE admin_decision IS NOT NULL")
-    reviewed_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM training_examples")
-    training_count = cursor.fetchone()[0]
-    
-    conn.close()
+    try:
+        from database import execute_query
+        total_messages = execute_query("SELECT COUNT(*) FROM messages", fetch='one')[0]
+        spam_count = execute_query("SELECT COUNT(*) FROM messages WHERE llm_result = 'СПАМ'", fetch='one')[0]
+        maybe_spam_count = execute_query("SELECT COUNT(*) FROM messages WHERE llm_result = 'ВОЗМОЖНО_СПАМ'", fetch='one')[0]
+        reviewed_count = execute_query("SELECT COUNT(*) FROM messages WHERE admin_decision IS NOT NULL", fetch='one')[0]
+        training_count = execute_query("SELECT COUNT(*) FROM training_examples", fetch='one')[0]
+    except:
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM messages")
+        total_messages = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM messages WHERE llm_result = 'СПАМ'")
+        spam_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM messages WHERE llm_result = 'ВОЗМОЖНО_СПАМ'")
+        maybe_spam_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM messages WHERE admin_decision IS NOT NULL")
+        reviewed_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM training_examples")
+        training_count = cursor.fetchone()[0]
+        
+        conn.close()
     
     stats_text = f"""📊 <b>Статистика антиспам-бота</b>
 
@@ -674,11 +718,15 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
     message_id = int(message_id)
     
     # Получаем текст сообщения из БД
-    conn = sqlite3.connect('antispam.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT text FROM messages WHERE message_id = ?", (message_id,))
-    result = cursor.fetchone()
-    conn.close()
+    try:
+        from database import execute_query
+        result = execute_query("SELECT text FROM messages WHERE message_id = ?", (message_id,), fetch='one')
+    except:
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT text FROM messages WHERE message_id = ?", (message_id,))
+        result = cursor.fetchone()
+        conn.close()
     
     if not result:
         await callback.answer("❌ Сообщение не найдено")
