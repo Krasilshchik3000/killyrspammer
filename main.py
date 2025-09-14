@@ -1,0 +1,700 @@
+import asyncio
+import logging
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram import F
+import sqlite3
+import re
+from enum import Enum
+from openai import AsyncOpenAI
+from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_ID, ALLOWED_GROUP_IDS
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Инициализация бота
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# Настройка OpenAI
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+# Глобальная переменная для хранения предложенного промпта
+pending_prompt = None
+awaiting_prompt_edit = False
+
+class SpamResult(Enum):
+    SPAM = "СПАМ"
+    NOT_SPAM = "НЕ_СПАМ"  
+    MAYBE_SPAM = "ВОЗМОЖНО_СПАМ"
+
+# Промпт для проверки спама
+SPAM_CHECK_PROMPT = """Проанализируй сообщение из телеграм-группы и ответь строго одним из трёх вариантов:
+СПАМ
+НЕ_СПАМ  
+ВОЗМОЖНО_СПАМ
+
+Считай особенно подозрительными: безадресные вакансии/работу "без опыта/высокий доход", призывы писать в ЛС/бота/внешние ссылки, сердечки 💘/💝 с намёком на интим-услуги. Если данных мало — выбирай ВОЗМОЖНО_СПАМ.
+
+Сообщение: «{message_text}»
+
+Ответ:"""
+
+def init_database():
+    """Инициализация базы данных"""
+    conn = sqlite3.connect('antispam.db')
+    cursor = conn.cursor()
+    
+    # Таблица сообщений
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY,
+            message_id INTEGER,
+            chat_id INTEGER,
+            user_id INTEGER,
+            username TEXT,
+            text TEXT,
+            created_at TIMESTAMP,
+            llm_result TEXT,
+            admin_decision TEXT,
+            admin_decided_at TIMESTAMP
+        )
+    ''')
+    
+    # Таблица обучающих примеров
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS training_examples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT,
+            is_spam BOOLEAN,
+            source TEXT,
+            created_at TIMESTAMP
+        )
+    ''')
+    
+    # Таблица промптов
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS prompts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prompt_text TEXT,
+            version INTEGER,
+            created_at TIMESTAMP,
+            is_active BOOLEAN DEFAULT FALSE,
+            improvement_reason TEXT
+        )
+    ''')
+    
+    # Вставляем базовый промпт, если таблица пустая
+    cursor.execute("SELECT COUNT(*) FROM prompts")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute('''
+            INSERT INTO prompts (prompt_text, version, created_at, is_active, improvement_reason)
+            VALUES (?, 1, ?, TRUE, 'Базовый промпт')
+        ''', (SPAM_CHECK_PROMPT, datetime.now()))
+    
+    conn.commit()
+    conn.close()
+
+def save_message_to_db(message: types.Message, llm_result: SpamResult = None):
+    """Сохранение сообщения в базу данных"""
+    conn = sqlite3.connect('antispam.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT OR REPLACE INTO messages 
+        (message_id, chat_id, user_id, username, text, created_at, llm_result)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        message.message_id,
+        message.chat.id,
+        message.from_user.id,
+        message.from_user.username or '',
+        message.text,
+        datetime.now(),
+        llm_result.value if llm_result else None
+    ))
+    
+    conn.commit()
+    conn.close()
+
+def update_admin_decision(message_id: int, decision: str):
+    """Обновление решения администратора"""
+    conn = sqlite3.connect('antispam.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        UPDATE messages 
+        SET admin_decision = ?, admin_decided_at = ?
+        WHERE message_id = ?
+    ''', (decision, datetime.now(), message_id))
+    
+    conn.commit()
+    conn.close()
+
+def add_training_example(text: str, is_spam: bool, source: str):
+    """Добавление примера для обучения"""
+    conn = sqlite3.connect('antispam.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT INTO training_examples (text, is_spam, source, created_at)
+        VALUES (?, ?, ?, ?)
+    ''', (text, is_spam, source, datetime.now()))
+    
+    conn.commit()
+    conn.close()
+
+def get_current_prompt():
+    """Получить текущий активный промпт"""
+    conn = sqlite3.connect('antispam.db')
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT prompt_text FROM prompts WHERE is_active = TRUE ORDER BY version DESC LIMIT 1")
+    result = cursor.fetchone()
+    conn.close()
+    
+    return result[0] if result else SPAM_CHECK_PROMPT
+
+def save_new_prompt(prompt_text: str, reason: str):
+    """Сохранить новый промпт"""
+    conn = sqlite3.connect('antispam.db')
+    cursor = conn.cursor()
+    
+    # Деактивируем старые промпты
+    cursor.execute("UPDATE prompts SET is_active = FALSE")
+    
+    # Получаем следующий номер версии
+    cursor.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM prompts")
+    next_version = cursor.fetchone()[0]
+    
+    # Добавляем новый промпт
+    cursor.execute('''
+        INSERT INTO prompts (prompt_text, version, created_at, is_active, improvement_reason)
+        VALUES (?, ?, ?, TRUE, ?)
+    ''', (prompt_text, next_version, datetime.now(), reason))
+    
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"Новый промпт сохранен (версия {next_version}): {reason}")
+
+def get_recent_mistakes(limit=10):
+    """Получить недавние ошибки бота для улучшения промпта"""
+    conn = sqlite3.connect('antispam.db')
+    cursor = conn.cursor()
+    
+    # Получаем примеры где бот ошибся
+    cursor.execute('''
+        SELECT text, llm_result, admin_decision, created_at
+        FROM messages 
+        WHERE admin_decision IS NOT NULL 
+        AND ((llm_result = 'НЕ_СПАМ' AND admin_decision = 'СПАМ') 
+             OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'НЕ_СПАМ'))
+        ORDER BY admin_decided_at DESC 
+        LIMIT ?
+    ''', (limit,))
+    
+    mistakes = cursor.fetchall()
+    conn.close()
+    
+    return mistakes
+
+def parse_llm_response(response_text: str) -> SpamResult:
+    """Парсинг ответа от LLM"""
+    cleaned = re.sub(r'[^\w\s_]', '', response_text.strip().upper())
+    
+    # Проверяем в правильном порядке - сначала более специфичные варианты
+    maybe_spam_keywords = ['ВОЗМОЖНО_СПАМ', 'ВОЗМОЖНО СПАМ', 'ВОЗМОЖНОСПАМ', 'MAYBE_SPAM', 'MAYBE SPAM', 'MAYBEСПАМ']
+    not_spam_keywords = ['НЕ_СПАМ', 'НЕ СПАМ', 'НЕСПАМ', 'NOT_SPAM', 'NOT SPAM', 'NOTSPAM']
+    spam_keywords = ['СПАМ', 'SPAM']
+    
+    if any(keyword in cleaned for keyword in maybe_spam_keywords):
+        return SpamResult.MAYBE_SPAM
+    elif any(keyword in cleaned for keyword in not_spam_keywords):
+        return SpamResult.NOT_SPAM
+    elif any(keyword in cleaned for keyword in spam_keywords):
+        return SpamResult.SPAM
+    
+    logger.warning(f"Не удалось распарсить ответ LLM: '{response_text}'")
+    return SpamResult.MAYBE_SPAM
+
+async def improve_prompt_with_ai(mistakes):
+    """Улучшение промпта с помощью ChatGPT на основе ошибок"""
+    current_prompt = get_current_prompt()
+    
+    mistakes_text = ""
+    for text, bot_decision, admin_decision, created_at in mistakes:
+        mistakes_text += f"Сообщение: '{text}'\nБот решил: {bot_decision}\nПравильно: {admin_decision}\n\n"
+    
+    improvement_prompt = f"""
+Ты эксперт по созданию промптов для определения спама в Telegram.
+
+ТЕКУЩИЙ ПРОМПТ:
+{current_prompt}
+
+ОШИБКИ БОТА (последние):
+{mistakes_text}
+
+Проанализируй ошибки и улучши промпт, чтобы бот лучше определял спам. 
+Сохрани структуру (три варианта ответа), но добавь более точные критерии на основе ошибок.
+
+ОТВЕТЬ ТОЛЬКО УЛУЧШЕННЫМ ПРОМПТОМ, БЕЗ ДОПОЛНИТЕЛЬНЫХ ОБЪЯСНЕНИЙ:
+"""
+    
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4",  # Используем GPT-4 для улучшения промптов
+            messages=[{"role": "user", "content": improvement_prompt}],
+            max_tokens=1000,
+            temperature=0.3,
+            timeout=30
+        )
+        
+        improved_prompt = response.choices[0].message.content.strip()
+        logger.info("Промпт улучшен через AI")
+        return improved_prompt
+        
+    except Exception as e:
+        logger.error(f"Ошибка улучшения промпта: {e}")
+        return None
+
+async def check_message_with_llm(message_text: str) -> SpamResult:
+    """Проверка сообщения через LLM"""
+    current_prompt = get_current_prompt()
+    prompt = current_prompt.format(message_text=message_text)
+    
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=5,
+            temperature=0,
+            timeout=10
+        )
+        
+        llm_answer = response.choices[0].message.content.strip()
+        result = parse_llm_response(llm_answer)
+        
+        logger.info(f"LLM ответ: '{llm_answer}' → {result.value}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Ошибка LLM: {e}")
+        return SpamResult.MAYBE_SPAM
+
+async def send_suspicious_message_to_admin(message: types.Message, result: SpamResult):
+    """Отправка подозрительного сообщения админу"""
+    result_emoji = "🔴" if result == SpamResult.SPAM else "🟡"
+    
+    admin_text = f"""{result_emoji} <b>{result.value}</b>
+
+<b>От:</b> {message.from_user.full_name} (@{message.from_user.username or 'нет username'})
+<b>Группа:</b> {message.chat.title}
+<b>Время:</b> {message.date.strftime('%H:%M:%S')}
+
+<b>Сообщение:</b>
+<code>{message.text}</code>"""
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="❌ СПАМ", callback_data=f"spam_{message.message_id}"),
+            InlineKeyboardButton(text="✅ НЕ СПАМ", callback_data=f"not_spam_{message.message_id}")
+        ]
+    ])
+    
+    try:
+        await bot.send_message(
+            ADMIN_ID, 
+            admin_text, 
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error(f"Ошибка отправки админу: {e}")
+
+
+@dp.message(F.content_type == 'text', F.forward_from)
+async def handle_forwarded_spam(message: types.Message):
+    """Обработка пересланных сообщений как примеров спама (ошибки бота)"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    # Добавляем как пример спама
+    add_training_example(message.text, True, 'FORWARDED_MISTAKE')
+    
+    # Проверяем, нужно ли улучшить промпт
+    mistakes = get_recent_mistakes(5)
+    if len(mistakes) >= 1:  # После каждой ошибки
+        await message.reply("🔄 Анализирую ошибки и улучшаю промпт...")
+        
+        improved_prompt = await improve_prompt_with_ai(mistakes)
+        if improved_prompt:
+            # Отправляем админу предложение по улучшению
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Применить", callback_data="apply_prompt"),
+                    InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_prompt"),
+                    InlineKeyboardButton(text="❌ Отклонить", callback_data="reject_prompt")
+                ]
+            ])
+            
+            prompt_message = f"""🤖 <b>Предлагаю улучшенный промпт:</b>
+
+<code>{improved_prompt}</code>
+
+<b>Основание:</b> Анализ последних {len(mistakes)} ошибок"""
+            
+            # Сохраняем предложенный промпт во временную переменную
+            global pending_prompt
+            pending_prompt = improved_prompt
+            
+            await bot.send_message(ADMIN_ID, prompt_message, reply_markup=keyboard, parse_mode='HTML')
+        else:
+            await message.reply("❌ Не удалось улучшить промпт автоматически")
+    else:
+        await message.reply(f"✅ Добавил в базу спама. Ошибок: {len(mistakes)} - анализирую для улучшения промпта")
+
+# ВАЖНО: Обработчики команд должны быть ПЕРЕД общим обработчиком текста!
+
+@dp.message(Command("start"))
+async def start_command(message: types.Message):
+    """Команда /start"""
+    logger.info(f"Команда /start от пользователя {message.from_user.id}")
+    await message.reply(
+        "🤖 Антиспам-бот запущен!\n\n"
+        "Я буду проверять все сообщения в группе через ИИ и отправлять подозрительные администратору.\n\n"
+        "Для обучения пересылайте мне примеры спама."
+    )
+
+@dp.message(Command("stats"))
+async def stats_command(message: types.Message):
+    """Статистика работы бота"""
+    logger.info(f"Команда /stats от пользователя {message.from_user.id}")
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("❌ Команда только для администратора")
+        return
+        
+    conn = sqlite3.connect('antispam.db')
+    cursor = conn.cursor()
+    
+    # Общая статистика
+    cursor.execute("SELECT COUNT(*) FROM messages")
+    total_messages = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM messages WHERE llm_result = 'СПАМ'")
+    spam_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM messages WHERE llm_result = 'ВОЗМОЖНО_СПАМ'")
+    maybe_spam_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM messages WHERE admin_decision IS NOT NULL")
+    reviewed_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM training_examples")
+    training_count = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    stats_text = f"""📊 <b>Статистика антиспам-бота</b>
+
+📝 Всего сообщений: {total_messages}
+🔴 Определено как спам: {spam_count}
+🟡 Возможно спам: {maybe_spam_count}
+✅ Проверено админом: {reviewed_count}
+🧠 Примеров для обучения: {training_count}"""
+    
+    await message.reply(stats_text, parse_mode='HTML')
+
+@dp.message(Command("editprompt"))
+async def edit_prompt_command(message: types.Message):
+    """Команда для редактирования промпта"""
+    logger.info(f"Команда /editprompt от пользователя {message.from_user.id}")
+    
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("❌ Команда только для администратора")
+        return
+    
+    global awaiting_prompt_edit
+    awaiting_prompt_edit = True
+    logger.info(f"Установлен режим редактирования: awaiting_prompt_edit = {awaiting_prompt_edit}")
+    
+    current_prompt = get_current_prompt()
+    edit_message = f"""✏️ <b>Редактирование промпта</b>
+
+<b>Текущий промпт:</b>
+<code>{current_prompt}</code>
+
+<b>Отправьте новый промпт.</b> Должен содержать:
+• Три варианта ответа: СПАМ, НЕ_СПАМ, ВОЗМОЖНО_СПАМ
+• Место для подстановки: {{message_text}}
+
+Для отмены: /cancel"""
+    
+    await message.reply(edit_message, parse_mode='HTML')
+
+@dp.message(Command("groups"))
+async def show_allowed_groups(message: types.Message):
+    """Показать список разрешенных групп"""
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("❌ Команда только для администратора")
+        return
+    
+    groups_text = "🔐 <b>Разрешенные группы:</b>\n\n"
+    for group_id in ALLOWED_GROUP_IDS:
+        groups_text += f"• ID: <code>{group_id}</code>\n"
+    
+    groups_text += f"\n<b>Всего групп:</b> {len(ALLOWED_GROUP_IDS)}"
+    groups_text += "\n\n💡 Только эти группы могут использовать API OpenAI"
+    
+    await message.reply(groups_text, parse_mode='HTML')
+
+@dp.message(Command("cancel"))
+async def cancel_command(message: types.Message):
+    """Команда для отмены редактирования"""
+    global awaiting_prompt_edit
+    
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    if awaiting_prompt_edit:
+        awaiting_prompt_edit = False
+        await message.reply("❌ Редактирование промпта отменено")
+    else:
+        await message.reply("ℹ️ Нет активного редактирования")
+
+
+@dp.message(F.text & F.from_user.id == ADMIN_ID & (F.chat.type == "private"))
+async def handle_admin_text(message: types.Message):
+    """Обработка текстовых сообщений от админа в ЛИЧКЕ (только для редактирования промпта в режиме ожидания)"""
+    global awaiting_prompt_edit, pending_prompt
+    
+    # Пропускаем команды - они должны обрабатываться другими хендлерами
+    if message.text and message.text.startswith('/'):
+        return
+    
+    # Обрабатываем ТОЛЬКО если находимся в режиме редактирования промпта
+    logger.info(f"handle_admin_text (ЛИЧКА): awaiting_prompt_edit = {awaiting_prompt_edit}")
+    if awaiting_prompt_edit:
+        
+        # Проверяем базовую структуру промпта
+        if "{message_text}" not in message.text:
+            await message.reply("❌ Промпт должен содержать {message_text} для подстановки сообщения")
+            return
+        
+        required_words = ["СПАМ", "НЕ_СПАМ", "ВОЗМОЖНО_СПАМ"]
+        if not all(word in message.text.upper() for word in required_words):
+            await message.reply("❌ Промпт должен содержать все три варианта ответа: СПАМ, НЕ_СПАМ, ВОЗМОЖНО_СПАМ")
+            return
+        
+        # Сохраняем новый промпт
+        save_new_prompt(message.text, "Ручное редактирование администратором")
+        awaiting_prompt_edit = False
+        pending_prompt = None
+        
+        # Получаем информацию о новом промпте
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT version, improvement_reason, created_at FROM prompts WHERE is_active = TRUE")
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            version, reason, created_at = result
+            new_prompt_info = f"✅ <b>Новый промпт сохранен и активирован!</b>\n\n📝 <b>Версия {version}</b>\n\n<code>{message.text}</code>\n\n<b>Изменение:</b> {reason}\n<b>Дата:</b> {created_at}"
+        else:
+            new_prompt_info = f"✅ <b>Новый промпт сохранен и активирован!</b>\n\n<code>{message.text}</code>"
+        
+        await message.reply(new_prompt_info, parse_mode='HTML')
+    else:
+        # Если не в режиме редактирования, обрабатываем как обычное сообщение
+        # Передаем дальше в общий обработчик
+        return
+
+@dp.message(F.content_type == 'text')
+async def handle_message(message: types.Message):
+    """Основная обработка сообщений"""
+    # Логируем все сообщения для отладки
+    logger.info(f"🔍 ПОЛУЧЕНО СООБЩЕНИЕ: от {message.from_user.id} (@{message.from_user.username}) в чате '{message.chat.title}' (тип: {message.chat.type}, ID: {message.chat.id})")
+    logger.info(f"📝 Текст: '{message.text[:100]}...'")
+    
+    # Пропускаем сообщения от бота
+    if message.from_user.is_bot:
+        logger.info("🤖 Пропускаем сообщение от бота")
+        return
+    
+    # В личных чатах обрабатываем только пересланные сообщения от админа
+    if message.chat.type == 'private':
+        if message.from_user.id != ADMIN_ID:
+            return  # Не админ - игнорируем
+        if not message.forward_from and not message.forward_from_chat:
+            return  # Админ, но НЕ пересланное сообщение - игнорируем
+    
+    # В группах проверяем белый список
+    elif message.chat.type in ['group', 'supergroup']:
+        if message.chat.id not in ALLOWED_GROUP_IDS:
+            logger.warning(f"🚫 ГРУППА НЕ В БЕЛОМ СПИСКЕ: {message.chat.title} (ID: {message.chat.id}) - игнорируем сообщение")
+            return
+    
+    # Пропускаем команды
+    if message.text and message.text.startswith('/'):
+        return
+        
+    logger.info(f"Проверяю сообщение от {message.from_user.username}: {message.text[:50]}...")
+    
+    # Проверяем через LLM
+    spam_result = await check_message_with_llm(message.text)
+    
+    # Сохраняем в БД
+    save_message_to_db(message, spam_result)
+    
+    # Если подозрительное - отправляем админу
+    if spam_result in [SpamResult.SPAM, SpamResult.MAYBE_SPAM]:
+        logger.info(f"🚨 Подозрительное сообщение ({spam_result.value}), отправляю админу...")
+        await send_suspicious_message_to_admin(message, spam_result)
+    else:
+        logger.info(f"✅ Сообщение чистое ({spam_result.value}), не отправляю админу")
+
+@dp.callback_query(F.data.startswith("spam_") | F.data.startswith("not_spam_"))
+async def handle_admin_feedback(callback: types.CallbackQuery):
+    """Обработка обратной связи от администратора"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Только для администратора")
+        return
+    
+    action, message_id = callback.data.split("_", 1)
+    message_id = int(message_id)
+    
+    # Получаем текст сообщения из БД
+    conn = sqlite3.connect('antispam.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT text FROM messages WHERE message_id = ?", (message_id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if not result:
+        await callback.answer("❌ Сообщение не найдено")
+        return
+    
+    message_text = result[0]
+    decision = "СПАМ" if action == "spam" else "НЕ_СПАМ"
+    is_spam = (action == "spam")
+    
+    # Обновляем решение админа
+    update_admin_decision(message_id, decision)
+    
+    # Добавляем в обучающие примеры
+    add_training_example(message_text, is_spam, 'ADMIN_FEEDBACK')
+    
+    # Обновляем сообщение
+    decision_emoji = "❌" if is_spam else "✅"
+    new_text = f"{callback.message.text}\n\n{decision_emoji} <b>Решение: {decision}</b>"
+    
+    await callback.message.edit_text(new_text, parse_mode='HTML')
+    
+    # Проверяем, нужно ли улучшить промпт (если это была ошибка бота)
+    mistakes = get_recent_mistakes(5)
+    if len(mistakes) >= 1:
+        await callback.answer(f"✅ Отмечено как {decision}. Обнаружена ошибка - предлагаю улучшить промпт!")
+        
+        # Запускаем улучшение промпта
+        improved_prompt = await improve_prompt_with_ai(mistakes)
+        if improved_prompt:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Применить", callback_data="apply_prompt"),
+                    InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_prompt"),
+                    InlineKeyboardButton(text="❌ Отклонить", callback_data="reject_prompt")
+                ]
+            ])
+            
+            global pending_prompt
+            pending_prompt = improved_prompt
+            
+            prompt_message = f"""🤖 <b>Предлагаю улучшенный промпт:</b>
+
+<code>{improved_prompt}</code>
+
+<b>Основание:</b> Анализ последних {len(mistakes)} ошибок"""
+            
+            await bot.send_message(ADMIN_ID, prompt_message, reply_markup=keyboard, parse_mode='HTML')
+    else:
+        await callback.answer(f"✅ Отмечено как {decision}")
+
+@dp.callback_query(F.data.in_(["apply_prompt", "edit_prompt", "reject_prompt", "edit_current_prompt"]))
+async def handle_prompt_management(callback: types.CallbackQuery):
+    """Обработка управления промптами"""
+    global pending_prompt, awaiting_prompt_edit
+    
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Только для администратора")
+        return
+    
+    if callback.data == "apply_prompt":
+        if pending_prompt:
+            save_new_prompt(pending_prompt, "Автоматическое улучшение на основе ошибок")
+            await callback.message.edit_text(
+                f"{callback.message.text}\n\n✅ <b>Промпт применен!</b>",
+                parse_mode='HTML'
+            )
+            await callback.answer("✅ Новый промпт активирован!")
+            pending_prompt = None
+        else:
+            await callback.answer("❌ Нет предложенного промпта")
+    
+    elif callback.data == "edit_prompt" or callback.data == "edit_current_prompt":
+        awaiting_prompt_edit = True
+        
+        if callback.data == "edit_current_prompt":
+            # Показываем текущий промпт для редактирования
+            current_prompt = get_current_prompt()
+            edit_message = f"✏️ <b>Редактирование текущего промпта</b>\n\n<b>Текущий промпт:</b>\n<code>{current_prompt}</code>\n\n"
+        else:
+            edit_message = "✏️ <b>Редактирование предложенного промпта</b>\n\n"
+        
+        edit_message += """Отправьте новый текст промпта. Должен содержать:
+• Три варианта ответа: СПАМ, НЕ_СПАМ, ВОЗМОЖНО_СПАМ
+• Место для подстановки сообщения: {message_text}
+
+Для отмены отправьте /cancel"""
+        
+        await callback.message.reply(edit_message, parse_mode='HTML')
+        await callback.answer("✏️ Жду новый промпт")
+    
+    elif callback.data == "reject_prompt":
+        pending_prompt = None
+        await callback.message.edit_text(
+            f"{callback.message.text}\n\n❌ <b>Промпт отклонен</b>",
+            parse_mode='HTML'
+        )
+        await callback.answer("❌ Промпт отклонен")
+
+async def main():
+    """Запуск бота"""
+    # Проверяем наличие необходимых переменных окружения
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN не найден в переменных окружения!")
+        return
+    
+    if not OPENAI_API_KEY:
+        logger.error("❌ OPENAI_API_KEY не найден в переменных окружения!")
+        return
+    
+    if ADMIN_ID == 0:
+        logger.error("❌ ADMIN_ID не найден в переменных окружения!")
+        return
+    
+    # Инициализация БД
+    init_database()
+    
+    logger.info("🤖 Kill Yr Spammers запускается...")
+    logger.info(f"👤 Администратор: {ADMIN_ID}")
+    logger.info(f"🔐 Разрешенных групп: {len(ALLOWED_GROUP_IDS)}")
+    
+    # Запуск polling
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
