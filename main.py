@@ -147,37 +147,59 @@ def add_training_example(text: str, is_spam: bool, source: str):
 
 def get_current_prompt():
     """Получить текущий активный промпт"""
-    conn = sqlite3.connect('antispam.db')
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT prompt_text FROM prompts WHERE is_active = TRUE ORDER BY version DESC LIMIT 1")
-    result = cursor.fetchone()
-    conn.close()
-    
-    return result[0] if result else SPAM_CHECK_PROMPT
+    try:
+        from database import execute_query
+        result = execute_query("SELECT prompt_text FROM prompts WHERE is_active = TRUE ORDER BY version DESC LIMIT 1", fetch='one')
+        return result[0] if result else SPAM_CHECK_PROMPT
+    except:
+        # Fallback к SQLite
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT prompt_text FROM prompts WHERE is_active = TRUE ORDER BY version DESC LIMIT 1")
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else SPAM_CHECK_PROMPT
 
 def save_new_prompt(prompt_text: str, reason: str):
     """Сохранить новый промпт"""
-    conn = sqlite3.connect('antispam.db')
-    cursor = conn.cursor()
-    
-    # Деактивируем старые промпты
-    cursor.execute("UPDATE prompts SET is_active = FALSE")
-    
-    # Получаем следующий номер версии
-    cursor.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM prompts")
-    next_version = cursor.fetchone()[0]
-    
-    # Добавляем новый промпт
-    cursor.execute('''
-        INSERT INTO prompts (prompt_text, version, created_at, is_active, improvement_reason)
-        VALUES (?, ?, ?, TRUE, ?)
-    ''', (prompt_text, next_version, datetime.now(), reason))
-    
-    conn.commit()
-    conn.close()
-    
-    logger.info(f"Новый промпт сохранен (версия {next_version}): {reason}")
+    try:
+        from database import execute_query
+        
+        # Деактивируем старые промпты
+        execute_query("UPDATE prompts SET is_active = FALSE")
+        
+        # Получаем следующий номер версии
+        result = execute_query("SELECT COALESCE(MAX(version), 0) + 1 FROM prompts", fetch='one')
+        next_version = result[0] if result else 1
+        
+        # Добавляем новый промпт
+        execute_query('''
+            INSERT INTO prompts (prompt_text, version, created_at, is_active, improvement_reason)
+            VALUES (?, ?, ?, TRUE, ?)
+        ''', (prompt_text, next_version, datetime.now(), reason))
+        
+        logger.info(f"✅ Новый промпт сохранен (версия {next_version}): {reason}")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения промпта: {e}")
+        
+        # Fallback к SQLite
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        
+        cursor.execute("UPDATE prompts SET is_active = FALSE")
+        cursor.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM prompts")
+        next_version = cursor.fetchone()[0]
+        
+        cursor.execute('''
+            INSERT INTO prompts (prompt_text, version, created_at, is_active, improvement_reason)
+            VALUES (?, ?, ?, TRUE, ?)
+        ''', (prompt_text, next_version, datetime.now(), reason))
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"✅ Новый промпт сохранен через fallback (версия {next_version}): {reason}")
 
 def get_recent_mistakes(limit=10):
     """Получить недавние ошибки бота для улучшения промпта"""
@@ -565,6 +587,7 @@ async def handle_admin_text(message: types.Message):
             return
         
         # Сохраняем новый промпт
+        logger.info(f"💾 Сохраняю новый промпт от админа (длина: {len(message.text)} символов)")
         save_new_prompt(message.text, "Ручное редактирование администратором")
         awaiting_prompt_edit = False
         pending_prompt = None
@@ -783,7 +806,8 @@ async def main():
         return
     
     # Инициализация БД
-    init_database()
+    from database import init_database as db_init
+    db_init()
     
     # Настройка меню команд
     commands = [
