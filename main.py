@@ -829,7 +829,8 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
         conn.close()
     
     if not result:
-        await callback.answer("❌ Сообщение не найдено")
+        logger.warning(f"⚠️ Сообщение {message_id} не найдено в БД (возможно, старое сообщение из другой базы)")
+        await callback.answer("❌ Сообщение не найдено в базе данных")
         return
     
     message_text, llm_result = result
