@@ -151,25 +151,32 @@ def init_database():
 
 def execute_query(query, params=None, fetch=False):
     """Универсальное выполнение запроса"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    if DATABASE_URL:
-        # PostgreSQL - заменяем ? на %s
-        query = query.replace('?', '%s')
-    
-    if params:
-        cursor.execute(query, params)
-    else:
-        cursor.execute(query)
-    
-    result = None
-    if fetch == 'one':
-        result = cursor.fetchone()
-    elif fetch == 'all':
-        result = cursor.fetchall()
-    
-    conn.commit()
-    conn.close()
-    
-    return result
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        if DATABASE_URL:
+            # PostgreSQL - заменяем ? на %s
+            query = query.replace('?', '%s')
+        
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        
+        result = None
+        if fetch == 'one':
+            result = cursor.fetchone()
+        elif fetch == 'all':
+            result = cursor.fetchall()
+        
+        conn.commit()
+        conn.close()
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка выполнения запроса: {e}")
+        logger.error(f"📝 Запрос: {query}")
+        logger.error(f"📝 Параметры: {params}")
+        raise

@@ -593,11 +593,15 @@ async def handle_admin_text(message: types.Message):
         pending_prompt = None
         
         # Получаем информацию о новом промпте
-        conn = sqlite3.connect('antispam.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT version, improvement_reason, created_at FROM prompts WHERE is_active = TRUE")
-        result = cursor.fetchone()
-        conn.close()
+        try:
+            from database import execute_query
+            result = execute_query("SELECT version, improvement_reason, created_at FROM prompts WHERE is_active = TRUE", fetch='one')
+        except:
+            conn = sqlite3.connect('antispam.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT version, improvement_reason, created_at FROM prompts WHERE is_active = TRUE")
+            result = cursor.fetchone()
+            conn.close()
         
         if result:
             version, reason, created_at = result
