@@ -826,6 +826,58 @@ async def show_prompt_version(message: types.Message):
     
     await message.reply(version_info, parse_mode='HTML')
 
+@dp.message(Command("logs"))
+async def show_action_logs(message: types.Message):
+    """Показать последние действия"""
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("❌ Команда только для администратора")
+        return
+    
+    try:
+        from action_logger import get_recent_actions
+        actions = get_recent_actions(10)  # Последние 10 действий
+        
+        if not actions:
+            await message.reply("📝 Логи действий пусты")
+            return
+        
+        logs_text = "📋 <b>Последние действия:</b>\n\n"
+        
+        for action in reversed(actions[-10:]):  # Показываем в обратном порядке (новые сверху)
+            timestamp = action["timestamp"][:19].replace('T', ' ')
+            action_type = action["action_type"]
+            
+            if action_type == "message_analysis":
+                result = action.get("result", {})
+                logs_text += f"🔍 <b>Анализ сообщения</b> ({timestamp})\n"
+                logs_text += f"   Результат: {result.get('llm_result', 'N/A')}\n"
+                logs_text += f"   Текст: {action['details'].get('text', '')[:50]}...\n\n"
+                
+            elif action_type == "button_click":
+                logs_text += f"🔘 <b>Кнопка: {action['details'].get('button', 'N/A')}</b> ({timestamp})\n"
+                logs_text += f"   Исходный результат: {action['details'].get('original_llm_result', 'N/A')}\n"
+                logs_text += f"   Текст: {action['details'].get('text', '')[:50]}...\n\n"
+                
+            elif action_type == "prompt_improvement":
+                result = action.get("result", {})
+                logs_text += f"🧠 <b>Улучшение промпта</b> ({timestamp})\n"
+                logs_text += f"   Тип ошибки: {action['details'].get('error_type', 'N/A')}\n"
+                logs_text += f"   Успешно: {action['details'].get('prompt_improved', False)}\n\n"
+                
+            elif action_type.startswith("error_"):
+                logs_text += f"❌ <b>Ошибка: {action_type}</b> ({timestamp})\n"
+                logs_text += f"   Сообщение: {action.get('error', 'N/A')[:100]}...\n\n"
+        
+        # Разбиваем на части если слишком длинное
+        if len(logs_text) > 4000:
+            logs_text = logs_text[:4000] + "\n\n... (обрезано)"
+        
+        await message.reply(logs_text, parse_mode='HTML')
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка показа логов: {e}")
+        await message.reply(f"❌ Ошибка получения логов: {e}")
+
 @dp.message(Command("cancel"))
 async def cancel_command(message: types.Message):
     """Команда для отмены редактирования"""
@@ -945,6 +997,23 @@ async def handle_message(message: types.Message):
     # Проверяем через LLM
     spam_result = await check_message_with_llm(message.text)
     
+    # Логируем анализ сообщения
+    try:
+        from action_logger import log_message_analysis
+        log_message_analysis(
+            message.message_id,
+            message.text,
+            {
+                "user_id": message.from_user.id,
+                "username": message.from_user.username,
+                "chat_title": message.chat.title,
+                "chat_id": message.chat.id
+            },
+            spam_result.value
+        )
+    except Exception as e:
+        logger.error(f"❌ Ошибка логирования анализа: {e}")
+    
     # Сохраняем в БД
     save_message_to_db(message, spam_result)
     
@@ -1044,6 +1113,13 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
     decision = "СПАМ" if action == "spam" else "НЕ_СПАМ"
     is_spam = (action == "spam")
     
+    # Логируем нажатие кнопки
+    try:
+        from action_logger import log_button_click
+        log_button_click(callback.from_user.id, action, message_id, message_text, llm_result)
+    except Exception as e:
+        logger.error(f"❌ Ошибка логирования кнопки: {e}")
+    
     # Обновляем решение админа
     update_admin_decision(message_id, decision)
     
@@ -1082,8 +1158,21 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
         try:
             analysis, improved_prompt = await analyze_bot_error(message_text, error_type)
             logger.info(f"🧠 Результат анализа: analysis={analysis is not None}, prompt={improved_prompt is not None}")
+            
+            # Логируем результат улучшения промпта
+            from action_logger import log_prompt_improvement
+            log_prompt_improvement(callback.from_user.id, error_type, message_text, analysis, improved_prompt)
+            
         except Exception as e:
             logger.error(f"❌ Ошибка в analyze_bot_error: {e}")
+            
+            # Логируем ошибку
+            from action_logger import log_error
+            log_error("prompt_improvement", callback.from_user.id, str(e), {
+                "error_type": error_type,
+                "message_text": message_text[:100]
+            })
+            
             analysis, improved_prompt = None, None
         
         if improved_prompt:
@@ -1220,6 +1309,7 @@ async def main():
         BotCommand(command="editprompt", description="✏️ Редактировать промпт (админ)"),
         BotCommand(command="groups", description="🔐 Список разрешенных групп (админ)"),
         BotCommand(command="version", description="📋 Версия промпта (админ)"),
+        BotCommand(command="logs", description="📝 Логи действий (админ)"),
         BotCommand(command="cancel", description="❌ Отменить редактирование (админ)")
     ]
     
