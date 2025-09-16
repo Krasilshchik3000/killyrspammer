@@ -136,6 +136,28 @@ def save_message_to_db(message: types.Message, llm_result: SpamResult = None):
         conn.commit()
         conn.close()
 
+def save_message_to_db_direct(message_id: int, chat_id: int, user_id: int, username: str, text: str, llm_result: str):
+    """Прямое сохранение сообщения в БД (для восстановления)"""
+    try:
+        from database import execute_query
+        execute_query('''
+            INSERT INTO messages 
+            (message_id, chat_id, user_id, username, text, created_at, llm_result)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (message_id) DO UPDATE SET
+            llm_result = EXCLUDED.llm_result
+        ''', (message_id, chat_id, user_id, username, text, datetime.now(), llm_result))
+    except:
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO messages 
+            (message_id, chat_id, user_id, username, text, created_at, llm_result)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (message_id, chat_id, user_id, username, text, datetime.now(), llm_result))
+        conn.commit()
+        conn.close()
+
 def update_admin_decision(message_id: int, decision: str):
     """Обновление решения администратора"""
     try:
@@ -858,6 +880,20 @@ async def handle_message(message: types.Message):
     # Сохраняем в БД
     save_message_to_db(message, spam_result)
     
+    # Дублируем в backup файл
+    try:
+        from backup_messages import backup_message
+        backup_message({
+            "message_id": message.message_id,
+            "chat_id": message.chat.id,
+            "user_id": message.from_user.id,
+            "username": message.from_user.username or "",
+            "text": message.text,
+            "llm_result": spam_result.value
+        })
+    except Exception as e:
+        logger.error(f"❌ Ошибка backup: {e}")
+    
     # Если подозрительное - отправляем админу
     if spam_result in [SpamResult.SPAM, SpamResult.MAYBE_SPAM]:
         logger.info(f"🚨 Подозрительное сообщение ({spam_result.value}), отправляю админу...")
@@ -899,9 +935,42 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
         conn.close()
     
     if not result:
-        logger.warning(f"⚠️ Сообщение {message_id} не найдено в БД (возможно, старое сообщение из другой базы)")
-        await callback.answer("❌ Сообщение не найдено в базе данных")
-        return
+        logger.warning(f"⚠️ Сообщение {message_id} не найдено в БД")
+        
+        # Пытаемся восстановить сообщение из самого callback
+        try:
+            # Извлекаем текст из сообщения callback
+            original_text = callback.message.text
+            if "Сообщение:" in original_text:
+                # Извлекаем текст между <code> тегами
+                import re
+                code_match = re.search(r'<code>(.*?)</code>', original_text, re.DOTALL)
+                if code_match:
+                    message_text = code_match.group(1).strip()
+                    
+                    # Определяем llm_result из эмодзи в сообщении
+                    if "🔴" in original_text:
+                        llm_result = "СПАМ"
+                    elif "🟡" in original_text:
+                        llm_result = "ВОЗМОЖНО_СПАМ"
+                    else:
+                        llm_result = "ВОЗМОЖНО_СПАМ"  # По умолчанию
+                    
+                    # Сохраняем восстановленное сообщение в БД
+                    save_message_to_db_direct(message_id, 0, 0, "unknown", message_text, llm_result)
+                    
+                    logger.info(f"🔄 Восстановлено сообщение из callback: '{message_text[:50]}...'")
+                    result = (message_text, llm_result)
+                else:
+                    await callback.answer("❌ Не удалось восстановить текст сообщения")
+                    return
+            else:
+                await callback.answer("❌ Сообщение не найдено в базе данных")
+                return
+        except Exception as e:
+            logger.error(f"❌ Ошибка восстановления сообщения: {e}")
+            await callback.answer("❌ Ошибка обработки сообщения")
+            return
     
     message_text, llm_result = result
     decision = "СПАМ" if action == "spam" else "НЕ_СПАМ"
@@ -1065,6 +1134,15 @@ async def main():
     # Инициализация БД
     from database import init_database as db_init
     db_init()
+    
+    # Восстанавливаем сообщения из backup файла
+    try:
+        from backup_messages import restore_messages_from_backup
+        restored_count = restore_messages_from_backup()
+        if restored_count > 0:
+            logger.info(f"🔄 Восстановлено {restored_count} сообщений из backup")
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось восстановить backup: {e}")
     
     # Настройка меню команд
     commands = [
