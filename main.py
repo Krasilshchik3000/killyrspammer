@@ -449,12 +449,31 @@ async def analyze_bot_error(message_text: str, error_type: str):
         if result:
             current_prompt, version = result
             logger.info(f"📖 Использую актуальный промпт версии {version} для анализа")
+            logger.info(f"🔍 Промпт содержит пункты: {'1.' in current_prompt and '2.' in current_prompt}")
         else:
             current_prompt = SPAM_CHECK_PROMPT
-            logger.warning("⚠️ Актуальный промпт не найден, использую базовый")
+            logger.warning("⚠️ Актуальный промпт не найден в PostgreSQL, использую базовый")
     except Exception as e:
-        logger.error(f"❌ Ошибка получения актуального промпта: {e}")
-        current_prompt = get_current_prompt()  # Fallback
+        logger.error(f"❌ Ошибка получения актуального промпта из PostgreSQL: {e}")
+        
+        # Пытаемся получить из SQLite fallback
+        try:
+            conn = sqlite3.connect('antispam.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT prompt_text, version FROM prompts WHERE is_active = TRUE ORDER BY version DESC LIMIT 1")
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                current_prompt, version = result
+                logger.warning(f"⚠️ Использую промпт из SQLite fallback (версия {version})")
+                logger.info(f"🔍 SQLite промпт содержит пункты: {'1.' in current_prompt and '2.' in current_prompt}")
+            else:
+                current_prompt = SPAM_CHECK_PROMPT
+                logger.error("❌ Промпт не найден даже в SQLite")
+        except Exception as e2:
+            logger.error(f"❌ Ошибка SQLite fallback: {e2}")
+            current_prompt = SPAM_CHECK_PROMPT
         
     logger.info(f"🧠 Анализирую ошибку типа '{error_type}' для сообщения: '{message_text[:50]}...'")
     logger.info(f"🔍 Текущий промпт содержит: {current_prompt[100:200]}...")
@@ -769,6 +788,43 @@ async def show_allowed_groups(message: types.Message):
     groups_text += "\n\n💡 Только эти группы могут использовать API OpenAI"
     
     await message.reply(groups_text, parse_mode='HTML')
+
+@dp.message(Command("version"))
+async def show_prompt_version(message: types.Message):
+    """Показать текущую версию промпта"""
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("❌ Команда только для администратора")
+        return
+    
+    # Проверяем PostgreSQL
+    try:
+        from database import execute_query
+        result = execute_query("SELECT version, improvement_reason, created_at, substr(prompt_text, 1, 200) FROM prompts WHERE is_active = TRUE", fetch='one')
+        if result:
+            version, reason, created_at, prompt_preview = result
+            version_info = f"🗄️ <b>PostgreSQL (основная БД):</b>\n📝 Версия: {version}\n🔄 Изменение: {reason}\n📅 Дата: {created_at}\n\n<code>{prompt_preview}...</code>"
+        else:
+            version_info = "🗄️ <b>PostgreSQL:</b> Промпт не найден"
+    except Exception as e:
+        version_info = f"🗄️ <b>PostgreSQL:</b> Ошибка подключения - {e}"
+    
+    # Проверяем SQLite fallback
+    try:
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT version, improvement_reason, created_at, substr(prompt_text, 1, 200) FROM prompts WHERE is_active = TRUE")
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            version, reason, created_at, prompt_preview = result
+            version_info += f"\n\n💾 <b>SQLite (fallback):</b>\n📝 Версия: {version}\n🔄 Изменение: {reason}\n📅 Дата: {created_at}\n\n<code>{prompt_preview}...</code>"
+        else:
+            version_info += "\n\n💾 <b>SQLite:</b> Промпт не найден"
+    except Exception as e:
+        version_info += f"\n\n💾 <b>SQLite:</b> Ошибка - {e}"
+    
+    await message.reply(version_info, parse_mode='HTML')
 
 @dp.message(Command("cancel"))
 async def cancel_command(message: types.Message):
@@ -1163,6 +1219,7 @@ async def main():
         BotCommand(command="stats", description="📊 Статистика работы (админ)"),
         BotCommand(command="editprompt", description="✏️ Редактировать промпт (админ)"),
         BotCommand(command="groups", description="🔐 Список разрешенных групп (админ)"),
+        BotCommand(command="version", description="📋 Версия промпта (админ)"),
         BotCommand(command="cancel", description="❌ Отменить редактирование (админ)")
     ]
     
