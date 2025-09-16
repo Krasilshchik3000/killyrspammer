@@ -61,14 +61,12 @@ def init_database():
             )
         ''')
         
-        # Таблица промптов
+        # Таблица промпта (только один активный)
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS prompts (
+            CREATE TABLE IF NOT EXISTS current_prompt (
                 id SERIAL PRIMARY KEY,
                 prompt_text TEXT,
-                version INTEGER,
-                created_at TIMESTAMP,
-                is_active BOOLEAN DEFAULT FALSE,
+                updated_at TIMESTAMP,
                 improvement_reason TEXT
             )
         ''')
@@ -85,7 +83,7 @@ def init_database():
         ''')
         
         # Вставляем базовый промпт, если таблица пустая
-        cursor.execute("SELECT COUNT(*) FROM prompts")
+        cursor.execute("SELECT COUNT(*) FROM current_prompt")
         if cursor.fetchone()[0] == 0:
             base_prompt = """Проанализируй сообщение из телеграм-группы и ответь строго одним из трёх вариантов:
 СПАМ
@@ -98,8 +96,8 @@ def init_database():
 
 Ответ:"""
             cursor.execute('''
-                INSERT INTO prompts (prompt_text, version, created_at, is_active, improvement_reason)
-                VALUES (%s, 1, %s, TRUE, 'Базовый промпт')
+                INSERT INTO current_prompt (prompt_text, updated_at, improvement_reason)
+                VALUES (%s, %s, 'Базовый промпт')
             ''', (base_prompt, datetime.now()))
         
     else:
@@ -134,14 +132,12 @@ def init_database():
             )
         ''')
         
-        # Таблица промптов
+        # Таблица промпта (только один активный)
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS prompts (
+            CREATE TABLE IF NOT EXISTS current_prompt (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 prompt_text TEXT,
-                version INTEGER,
-                created_at TIMESTAMP,
-                is_active BOOLEAN DEFAULT FALSE,
+                updated_at TIMESTAMP,
                 improvement_reason TEXT
             )
         ''')
@@ -158,7 +154,7 @@ def init_database():
         ''')
         
         # Вставляем базовый промпт, если таблица пустая
-        cursor.execute("SELECT COUNT(*) FROM prompts")
+        cursor.execute("SELECT COUNT(*) FROM current_prompt")
         if cursor.fetchone()[0] == 0:
             base_prompt = """Проанализируй сообщение из телеграм-группы и ответь строго одним из трёх вариантов:
 СПАМ
@@ -171,8 +167,8 @@ def init_database():
 
 Ответ:"""
             cursor.execute('''
-                INSERT INTO prompts (prompt_text, version, created_at, is_active, improvement_reason)
-                VALUES (?, 1, ?, TRUE, 'Базовый промпт')
+                INSERT INTO current_prompt (prompt_text, updated_at, improvement_reason)
+                VALUES (?, ?, 'Базовый промпт')
             ''', (base_prompt, datetime.now()))
     
     conn.commit()

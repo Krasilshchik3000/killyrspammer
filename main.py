@@ -203,12 +203,11 @@ def get_current_prompt():
     
     try:
         from database import execute_query
-        result = execute_query("SELECT prompt_text, version, improvement_reason FROM prompts WHERE is_active = TRUE ORDER BY version DESC LIMIT 1", fetch='one')
+        result = execute_query("SELECT prompt_text, improvement_reason FROM current_prompt ORDER BY id DESC LIMIT 1", fetch='one')
         
         if result:
-            prompt, version, reason = result
+            prompt, reason = result
             logger.info(f"📖 ЗАГРУЖЕН ПРОМПТ ИЗ POSTGRESQL:")
-            logger.info(f"   Версия: {version}")
             logger.info(f"   Причина: {reason}")
             logger.info(f"   Содержит пункты 1-5: {'1.' in prompt and '2.' in prompt and '3.' in prompt}")
             logger.info(f"   Содержит исключения: {'Исключения' in prompt}")
@@ -225,14 +224,13 @@ def get_current_prompt():
     try:
         conn = sqlite3.connect('antispam.db')
         cursor = conn.cursor()
-        cursor.execute("SELECT prompt_text, version, improvement_reason FROM prompts WHERE is_active = TRUE ORDER BY version DESC LIMIT 1")
+        cursor.execute("SELECT prompt_text, improvement_reason FROM current_prompt ORDER BY id DESC LIMIT 1")
         result = cursor.fetchone()
         conn.close()
         
         if result:
-            prompt, version, reason = result
+            prompt, reason = result
             logger.warning(f"⚠️ ЗАГРУЖЕН ПРОМПТ ИЗ SQLITE:")
-            logger.warning(f"   Версия: {version}")
             logger.warning(f"   Причина: {reason}")
             logger.warning(f"   Содержит пункты 1-5: {'1.' in prompt and '2.' in prompt and '3.' in prompt}")
             logger.warning(f"   Содержит исключения: {'Исключения' in prompt}")
@@ -247,25 +245,20 @@ def get_current_prompt():
     return SPAM_CHECK_PROMPT
 
 def save_new_prompt(prompt_text: str, reason: str):
-    """Сохранить новый промпт"""
+    """Сохранить новый промпт (заменяет предыдущий)"""
     try:
         from database import execute_query
         
-        # Деактивируем старые промпты
-        execute_query("UPDATE prompts SET is_active = FALSE")
+        # Удаляем ВСЕ старые промпты
+        execute_query("DELETE FROM current_prompt")
         
-        # Получаем следующий номер версии
-        result = execute_query("SELECT COALESCE(MAX(version), 0) + 1 FROM prompts", fetch='one')
-        next_version = result[0] if result else 1
-        
-        # Добавляем новый промпт
+        # Добавляем новый промпт (единственный)
         execute_query('''
-            INSERT INTO prompts (prompt_text, version, created_at, is_active, improvement_reason)
-            VALUES (?, ?, ?, TRUE, ?)
-        ''', (prompt_text, next_version, datetime.now(), reason))
+            INSERT INTO current_prompt (prompt_text, updated_at, improvement_reason)
+            VALUES (?, ?, ?)
+        ''', (prompt_text, datetime.now(), reason))
         
-        logger.info(f"✅ ПРОМПТ СОХРАНЕН В POSTGRESQL:")
-        logger.info(f"   Версия: {next_version}")
+        logger.info(f"✅ ПРОМПТ ЗАМЕНЕН В POSTGRESQL:")
         logger.info(f"   Причина: {reason}")
         logger.info(f"   Длина: {len(prompt_text)} символов")
         logger.info(f"   Содержит пункты: {'1.' in prompt_text and '2.' in prompt_text}")
@@ -278,19 +271,18 @@ def save_new_prompt(prompt_text: str, reason: str):
         conn = sqlite3.connect('antispam.db')
         cursor = conn.cursor()
         
-        cursor.execute("UPDATE prompts SET is_active = FALSE")
-        cursor.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM prompts")
-        next_version = cursor.fetchone()[0]
+        # Удаляем все старые
+        cursor.execute("DELETE FROM current_prompt")
         
         cursor.execute('''
-            INSERT INTO prompts (prompt_text, version, created_at, is_active, improvement_reason)
-            VALUES (?, ?, ?, TRUE, ?)
-        ''', (prompt_text, next_version, datetime.now(), reason))
+            INSERT INTO current_prompt (prompt_text, updated_at, improvement_reason)
+            VALUES (?, ?, ?)
+        ''', (prompt_text, datetime.now(), reason))
         
         conn.commit()
         conn.close()
         
-        logger.info(f"✅ Новый промпт сохранен через fallback (версия {next_version}): {reason}")
+        logger.info(f"✅ Промпт заменен через SQLite fallback: {reason}")
 
 def get_recent_mistakes(limit=10):
     """Получить недавние ошибки бота для улучшения промпта"""
@@ -479,38 +471,9 @@ async def analyze_bot_error(message_text: str, error_type: str):
         logger.error("❌ OpenAI клиент не инициализирован")
         return None, None
     
-    # Принудительно получаем актуальный промпт из основной БД
-    try:
-        from database import execute_query
-        result = execute_query("SELECT prompt_text, version FROM prompts WHERE is_active = TRUE ORDER BY version DESC LIMIT 1", fetch='one')
-        if result:
-            current_prompt, version = result
-            logger.info(f"📖 Использую актуальный промпт версии {version} для анализа")
-            logger.info(f"🔍 Промпт содержит пункты: {'1.' in current_prompt and '2.' in current_prompt}")
-        else:
-            current_prompt = SPAM_CHECK_PROMPT
-            logger.warning("⚠️ Актуальный промпт не найден в PostgreSQL, использую базовый")
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения актуального промпта из PostgreSQL: {e}")
-        
-        # Пытаемся получить из SQLite fallback
-        try:
-            conn = sqlite3.connect('antispam.db')
-            cursor = conn.cursor()
-            cursor.execute("SELECT prompt_text, version FROM prompts WHERE is_active = TRUE ORDER BY version DESC LIMIT 1")
-            result = cursor.fetchone()
-            conn.close()
-            
-            if result:
-                current_prompt, version = result
-                logger.warning(f"⚠️ Использую промпт из SQLite fallback (версия {version})")
-                logger.info(f"🔍 SQLite промпт содержит пункты: {'1.' in current_prompt and '2.' in current_prompt}")
-            else:
-                current_prompt = SPAM_CHECK_PROMPT
-                logger.error("❌ Промпт не найден даже в SQLite")
-        except Exception as e2:
-            logger.error(f"❌ Ошибка SQLite fallback: {e2}")
-            current_prompt = SPAM_CHECK_PROMPT
+    # Принудительно получаем актуальный промпт
+    current_prompt = get_current_prompt()
+    logger.info(f"🧠 Для анализа ошибки используется промпт с пунктами: {'1.' in current_prompt and '2.' in current_prompt}")
         
     logger.info(f"🧠 Анализирую ошибку типа '{error_type}' для сообщения: '{message_text[:50]}...'")
     logger.info(f"🔍 Текущий промпт содержит: {current_prompt[100:200]}...")
