@@ -29,10 +29,19 @@ def get_db_connection():
 
 def init_database():
     """Инициализация базы данных"""
+    logger.info("🔄 Инициализация БД - удаляю старые таблицы промптов")
+    
     if DATABASE_URL:
         # PostgreSQL
         conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # УДАЛЯЕМ старую таблицу промптов если существует
+        try:
+            cursor.execute("DROP TABLE IF EXISTS prompts")
+            logger.info("🗑️ Удалена старая таблица prompts")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось удалить старую таблицу: {e}")
         
         # Таблица сообщений
         cursor.execute('''
@@ -104,6 +113,13 @@ def init_database():
         # SQLite (старый код)
         conn = sqlite3.connect(DATABASE_PATH)
         cursor = conn.cursor()
+        
+        # УДАЛЯЕМ старую таблицу промптов если существует
+        try:
+            cursor.execute("DROP TABLE IF EXISTS prompts")
+            logger.info("🗑️ Удалена старая таблица prompts из SQLite")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось удалить старую таблицу из SQLite: {e}")
         
         # Таблица сообщений
         cursor.execute('''

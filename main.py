@@ -826,6 +826,37 @@ async def show_prompt_version(message: types.Message):
     
     await message.reply(version_info, parse_mode='HTML')
 
+@dp.message(Command("cleanup"))
+async def cleanup_old_prompts(message: types.Message):
+    """Принудительная очистка старых промптов"""
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("❌ Команда только для администратора")
+        return
+    
+    try:
+        # Удаляем старую таблицу из PostgreSQL
+        from database import execute_query
+        execute_query("DROP TABLE IF EXISTS prompts")
+        
+        # Удаляем из SQLite
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS prompts")
+        conn.commit()
+        conn.close()
+        
+        await message.reply("✅ Старые таблицы промптов удалены. Перезапускаю инициализацию...")
+        
+        # Переинициализируем БД
+        from database import init_database as db_init
+        db_init()
+        
+        await message.reply("✅ База данных очищена и переинициализирована")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка очистки: {e}")
+        await message.reply(f"❌ Ошибка очистки: {e}")
+
 @dp.message(Command("logs"))
 async def show_action_logs(message: types.Message):
     """Показать последние действия"""
@@ -943,13 +974,12 @@ async def handle_admin_text(message: types.Message):
         # Получаем информацию о новом промпте
         try:
             from database import execute_query
-            result = execute_query("SELECT version, improvement_reason, created_at FROM prompts WHERE is_active = TRUE", fetch='one')
+            result = execute_query("SELECT improvement_reason, updated_at FROM current_prompt ORDER BY id DESC LIMIT 1", fetch='one')
+            if result:
+                reason, created_at = result
+                result = (1, reason, created_at)  # Фейковая версия для совместимости
         except:
-            conn = sqlite3.connect('antispam.db')
-            cursor = conn.cursor()
-            cursor.execute("SELECT version, improvement_reason, created_at FROM prompts WHERE is_active = TRUE")
-            result = cursor.fetchone()
-            conn.close()
+            result = (1, reason, datetime.now())
         
         if result:
             version, reason, created_at = result
@@ -1309,6 +1339,7 @@ async def main():
         BotCommand(command="editprompt", description="✏️ Редактировать промпт (админ)"),
         BotCommand(command="groups", description="🔐 Список разрешенных групп (админ)"),
         BotCommand(command="version", description="📋 Версия промпта (админ)"),
+        BotCommand(command="cleanup", description="🗑️ Очистить старые промпты (админ)"),
         BotCommand(command="logs", description="📝 Логи действий (админ)"),
         BotCommand(command="cancel", description="❌ Отменить редактирование (админ)")
     ]
