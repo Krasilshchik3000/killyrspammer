@@ -1071,45 +1071,74 @@ async def sync_prompts(message: types.Message):
 
 @dp.message(Command("diagnose"))
 async def full_prompt_diagnosis(message: types.Message):
-    """Полная диагностика всех источников промптов"""
+    """Полная диагностика - сравнение с эталонным промптом"""
     if message.from_user.id != ADMIN_ID:
         await message.reply("❌ Команда только для администратора")
         return
     
-    await message.reply("🔍 Запускаю полную диагностику всех источников промптов...")
+    await message.reply("🔍 Анализирую все источники промптов и сравниваю с эталоном...")
     
-    diagnosis = "🔍 <b>ПОЛНАЯ ДИАГНОСТИКА ПРОМПТОВ:</b>\n\n"
+    # Получаем эталонный промпт - тот что должен быть везде
+    reference_prompt = """Проанализируй сообщение из телеграм-группы и ответь строго одним из трёх вариантов:
+СПАМ
+НЕ_СПАМ  
+ВОЗМОЖНО_СПАМ
+
+Считай особенно подозрительными: 
+
+1. Безадресные вакансии или предложения быстро заработать деньги 
+2. Призывы писать в личные сообщения, бота или переходить по внешним ссылкам.
+3. Сообщения, содержащие эмодзи 💘/💝/👄 и подобные им.
+4. Предложения заработать или получить деньги
+5. Необоснованное упоминание финансовых операций, криптовалюты, инвестиций.
+6. В сообщении много эмодзи, которые используются не для эмоций, а, например, для структурирования информации
+
+Если сообщение по этим критериям не подходит под спам, но у тебя есть серьезные причины думать, что это спам — выбирай ВОЗМОЖНО_СПАМ.
+
+Исключения и уточнения:
+
+- Не считай спамом аббревиатуры и названия политических партий, даже если они встречаются в подозрительном контексте.
+- Если сообщение содержит только информацию о вакансии без признаков мошенничества (например, указан адрес компании и требования к кандидату), считай его НЕ_СПАМ.
+- Если сообщение содержит ссылку, но она ведет на официальный ресурс без признаков мошенничества (например, на сайт государственной службы), считай его НЕ_СПАМ.
+- Если сообщение короткое и не содержит явных признаков спама, считай его НЕ_СПАМ, даже если данных для анализа мало.
+
+Сообщение: «{message_text}»
+
+Ответ:"""
     
-    # 1. Проверяем get_current_prompt()
+    diagnosis = f"🎯 <b>ЭТАЛОННЫЙ ПРОМПТ (должен быть везде):</b>\n<code>{reference_prompt}</code>\n\n"
+    diagnosis += "📊 <b>СРАВНЕНИЕ С ЭТАЛОНОМ:</b>\n\n"
+    
+    sources = []
+    
+    # 1. get_current_prompt()
     try:
         current = get_current_prompt()
-        has_point6 = "6." in current and "структурирования информации" in current
-        has_emoji_heart = "👄" in current
-        diagnosis += f"1️⃣ <b>get_current_prompt():</b>\n"
-        diagnosis += f"   Пункт 6: {'✅' if has_point6 else '❌'}\n"
-        diagnosis += f"   Эмодзи 👄: {'✅' if has_emoji_heart else '❌'}\n"
-        diagnosis += f"   Длина: {len(current)}\n\n"
+        if current.strip() == reference_prompt.strip():
+            diagnosis += "1️⃣ <b>get_current_prompt():</b> ✅ ИДЕНТИЧЕН\n"
+        else:
+            diagnosis += "1️⃣ <b>get_current_prompt():</b> ❌ ОТЛИЧАЕТСЯ\n"
+            sources.append(("get_current_prompt()", current))
     except Exception as e:
-        diagnosis += f"1️⃣ <b>get_current_prompt():</b> ❌ {e}\n\n"
+        diagnosis += f"1️⃣ <b>get_current_prompt():</b> ❌ ОШИБКА - {e}\n"
     
-    # 2. Проверяем PostgreSQL напрямую
+    # 2. PostgreSQL
     try:
         from database import execute_query
         result = execute_query("SELECT prompt_text FROM current_prompt ORDER BY id DESC LIMIT 1", fetch='one')
         if result:
             pg_prompt = result[0]
-            has_point6 = "6." in pg_prompt and "структурирования информации" in pg_prompt
-            has_emoji_heart = "👄" in pg_prompt
-            diagnosis += f"2️⃣ <b>PostgreSQL прямой запрос:</b>\n"
-            diagnosis += f"   Пункт 6: {'✅' if has_point6 else '❌'}\n"
-            diagnosis += f"   Эмодзи 👄: {'✅' if has_emoji_heart else '❌'}\n"
-            diagnosis += f"   Длина: {len(pg_prompt)}\n\n"
+            if pg_prompt.strip() == reference_prompt.strip():
+                diagnosis += "2️⃣ <b>PostgreSQL:</b> ✅ ИДЕНТИЧЕН\n"
+            else:
+                diagnosis += "2️⃣ <b>PostgreSQL:</b> ❌ ОТЛИЧАЕТСЯ\n"
+                sources.append(("PostgreSQL", pg_prompt))
         else:
-            diagnosis += "2️⃣ <b>PostgreSQL:</b> ❌ Промпт не найден\n\n"
+            diagnosis += "2️⃣ <b>PostgreSQL:</b> ❌ НЕ НАЙДЕН\n"
     except Exception as e:
-        diagnosis += f"2️⃣ <b>PostgreSQL:</b> ❌ {e}\n\n"
+        diagnosis += f"2️⃣ <b>PostgreSQL:</b> ❌ ОШИБКА - {e}\n"
     
-    # 3. Проверяем SQLite напрямую
+    # 3. SQLite
     try:
         conn = sqlite3.connect('antispam.db')
         cursor = conn.cursor()
@@ -1119,29 +1148,39 @@ async def full_prompt_diagnosis(message: types.Message):
         
         if result:
             sq_prompt = result[0]
-            has_point6 = "6." in sq_prompt and "структурирования информации" in sq_prompt
-            has_emoji_heart = "👄" in sq_prompt
-            diagnosis += f"3️⃣ <b>SQLite прямой запрос:</b>\n"
-            diagnosis += f"   Пункт 6: {'✅' if has_point6 else '❌'}\n"
-            diagnosis += f"   Эмодзи 👄: {'✅' if has_emoji_heart else '❌'}\n"
-            diagnosis += f"   Длина: {len(sq_prompt)}\n\n"
+            if sq_prompt.strip() == reference_prompt.strip():
+                diagnosis += "3️⃣ <b>SQLite:</b> ✅ ИДЕНТИЧЕН\n\n"
+            else:
+                diagnosis += "3️⃣ <b>SQLite:</b> ❌ ОТЛИЧАЕТСЯ\n\n"
+                sources.append(("SQLite", sq_prompt))
         else:
-            diagnosis += "3️⃣ <b>SQLite:</b> ❌ Промпт не найден\n\n"
+            diagnosis += "3️⃣ <b>SQLite:</b> ❌ НЕ НАЙДЕН\n\n"
     except Exception as e:
-        diagnosis += f"3️⃣ <b>SQLite:</b> ❌ {e}\n\n"
+        diagnosis += f"3️⃣ <b>SQLite:</b> ❌ ОШИБКА - {e}\n\n"
     
-    # 4. Проверяем что происходит при анализе сообщения
-    try:
-        test_prompt = get_current_prompt()
-        formatted = test_prompt.format(message_text="ТЕСТ")
-        has_point6_formatted = "6." in formatted and "структурирования информации" in formatted
-        diagnosis += f"4️⃣ <b>При анализе сообщений используется:</b>\n"
-        diagnosis += f"   Пункт 6: {'✅' if has_point6_formatted else '❌'}\n"
-        diagnosis += f"   Длина: {len(formatted)}\n\n"
-    except Exception as e:
-        diagnosis += f"4️⃣ <b>Анализ сообщений:</b> ❌ {e}\n\n"
+    # Показываем различия если есть
+    if sources:
+        diagnosis += "🚨 <b>ОБНАРУЖЕНЫ РАЗЛИЧИЯ:</b>\n\n"
+        for source_name, source_prompt in sources:
+            # Находим первое различие
+            ref_lines = reference_prompt.strip().split('\n')
+            src_lines = source_prompt.strip().split('\n')
+            
+            for i, (ref_line, src_line) in enumerate(zip(ref_lines, src_lines)):
+                if ref_line.strip() != src_line.strip():
+                    diagnosis += f"❌ <b>{source_name} отличается на строке {i+1}:</b>\n"
+                    diagnosis += f"   Эталон: <code>{ref_line}</code>\n"
+                    diagnosis += f"   Источник: <code>{src_line}</code>\n\n"
+                    break
+            else:
+                if len(ref_lines) != len(src_lines):
+                    diagnosis += f"❌ <b>{source_name} отличается количеством строк:</b>\n"
+                    diagnosis += f"   Эталон: {len(ref_lines)} строк\n"
+                    diagnosis += f"   Источник: {len(src_lines)} строк\n\n"
+    else:
+        diagnosis += "🎉 <b>ВСЕ ПРОМПТЫ ИДЕНТИЧНЫ ЭТАЛОНУ!</b>\n"
     
-    # Разбиваем на части если длинное
+    # Разбиваем на части
     if len(diagnosis) > 4000:
         await message.reply(diagnosis[:4000] + "\n\n...(продолжение)", parse_mode='HTML')
         await message.reply(diagnosis[4000:], parse_mode='HTML')
