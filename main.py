@@ -1182,10 +1182,33 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
         logger.info(f"🚨 Запускаю обучение! Тип: {error_type}")
         await callback.answer(f"✅ Отмечено как {decision}. Улучшаю промпт...")
         
+        # Отправляем промежуточное сообщение о прогрессе
+        progress_message = await bot.send_message(
+            ADMIN_ID, 
+            f"🔄 <b>Анализирую ошибку...</b>\n\n"
+            f"📝 Сообщение: <code>{message_text}</code>\n"
+            f"🤖 Бот решил: {llm_result}\n"
+            f"👤 Ваше решение: {decision}\n"
+            f"🧠 Тип анализа: {error_type}\n\n"
+            f"⏳ Отправляю запрос в ChatGPT-4...",
+            parse_mode='HTML'
+        )
+        
         logger.info(f"📊 Тип обучения: {error_type}")
         
         # Анализируем ошибку через ChatGPT
         try:
+            # Обновляем прогресс
+            await progress_message.edit_text(
+                f"🔄 <b>Анализирую ошибку...</b>\n\n"
+                f"📝 Сообщение: <code>{message_text}</code>\n"
+                f"🤖 Бот решил: {llm_result}\n"
+                f"👤 Ваше решение: {decision}\n"
+                f"🧠 Тип анализа: {error_type}\n\n"
+                f"🤖 ChatGPT-4 анализирует...",
+                parse_mode='HTML'
+            )
+            
             analysis, improved_prompt = await analyze_bot_error(message_text, error_type)
             logger.info(f"🧠 Результат анализа: analysis={analysis is not None}, prompt={improved_prompt is not None}")
             
@@ -1193,8 +1216,19 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
             from action_logger import log_prompt_improvement
             log_prompt_improvement(callback.from_user.id, error_type, message_text, analysis, improved_prompt)
             
+            # Удаляем прогресс сообщение
+            await progress_message.delete()
+            
         except Exception as e:
             logger.error(f"❌ Ошибка в analyze_bot_error: {e}")
+            
+            # Обновляем прогресс с ошибкой
+            await progress_message.edit_text(
+                f"❌ <b>Ошибка анализа</b>\n\n"
+                f"📝 Сообщение: <code>{message_text}</code>\n"
+                f"🚨 Ошибка: {str(e)[:200]}...",
+                parse_mode='HTML'
+            )
             
             # Логируем ошибку
             from action_logger import log_error
