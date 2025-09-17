@@ -541,9 +541,13 @@ async def send_suspicious_message_to_admin(message: types.Message, result: SpamR
 
 async def analyze_bot_error(message_text: str, error_type: str):
     """Анализ ошибки бота через ChatGPT"""
+    logger.info(f"🔍 НАЧИНАЮ analyze_bot_error: error_type={error_type}")
+    
     if not openai_client:
         logger.error("❌ OpenAI клиент не инициализирован")
         return None, None
+    
+    logger.info(f"✅ OpenAI клиент доступен: {openai_client is not None}")
     
     # Принудительно получаем актуальный промпт
     current_prompt = get_current_prompt()
@@ -622,6 +626,9 @@ async def analyze_bot_error(message_text: str, error_type: str):
 ИТОГОВЫЙ_ПРОМПТ: [полный промпт с ВСЕМИ старыми критериями + новыми исключениями/уточнениями]"""
 
     try:
+        logger.info(f"🤖 Отправляю запрос в ChatGPT-4...")
+        logger.info(f"📝 Длина промпта для анализа: {len(analysis_prompt)} символов")
+        
         response = await openai_client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": analysis_prompt}],
@@ -630,8 +637,17 @@ async def analyze_bot_error(message_text: str, error_type: str):
             timeout=30
         )
         
+        logger.info(f"✅ Получен ответ от ChatGPT-4")
+        
         analysis = response.choices[0].message.content.strip()
-        logger.info(f"🧠 ChatGPT проанализировал ошибку: {analysis[:100]}...")
+        logger.info(f"🧠 ChatGPT ответил (длина {len(analysis)}): {analysis[:100]}...")
+        
+        # Проверяем формат ответа
+        if "ИТОГОВЫЙ_ПРОМПТ:" in analysis:
+            logger.info("✅ Ответ содержит ИТОГОВЫЙ_ПРОМПТ")
+        else:
+            logger.warning("⚠️ Ответ НЕ содержит ИТОГОВЫЙ_ПРОМПТ")
+            logger.warning(f"📝 Полный ответ: {analysis}")
         
         # Извлекаем готовый итоговый промпт
         if "ИТОГОВЫЙ_ПРОМПТ:" in analysis:
@@ -1406,13 +1422,20 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
             await progress_message.delete()
             
         except Exception as e:
-            logger.error(f"❌ Ошибка в analyze_bot_error: {e}")
+            logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА В analyze_bot_error: {e}")
             
-            # Обновляем прогресс с ошибкой
+            # Детальная диагностика ошибки
+            import traceback
+            error_details = traceback.format_exc()
+            logger.error(f"📝 ПОЛНАЯ ОШИБКА: {error_details}")
+            
+            # Обновляем прогресс с детальной ошибкой
             await progress_message.edit_text(
-                f"❌ <b>Ошибка анализа</b>\n\n"
+                f"❌ <b>Критическая ошибка анализа</b>\n\n"
                 f"📝 Сообщение: <code>{message_text}</code>\n"
-                f"🚨 Ошибка: {str(e)[:200]}...",
+                f"🚨 Ошибка: <code>{str(e)}</code>\n"
+                f"🔧 Тип: {type(e).__name__}\n\n"
+                f"💡 Попробуйте /logs для диагностики",
                 parse_mode='HTML'
             )
             
@@ -1420,7 +1443,8 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
             from action_logger import log_error
             log_error("prompt_improvement", callback.from_user.id, str(e), {
                 "error_type": error_type,
-                "message_text": message_text[:100]
+                "message_text": message_text[:100],
+                "full_traceback": error_details
             })
             
             analysis, improved_prompt = None, None
