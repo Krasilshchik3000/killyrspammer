@@ -1069,6 +1069,85 @@ async def sync_prompts(message: types.Message):
     
     await message.reply("✅ Промпты синхронизированы во всех базах!")
 
+@dp.message(Command("diagnose"))
+async def full_prompt_diagnosis(message: types.Message):
+    """Полная диагностика всех источников промптов"""
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("❌ Команда только для администратора")
+        return
+    
+    await message.reply("🔍 Запускаю полную диагностику всех источников промптов...")
+    
+    diagnosis = "🔍 <b>ПОЛНАЯ ДИАГНОСТИКА ПРОМПТОВ:</b>\n\n"
+    
+    # 1. Проверяем get_current_prompt()
+    try:
+        current = get_current_prompt()
+        has_point6 = "6." in current and "структурирования информации" in current
+        has_emoji_heart = "👄" in current
+        diagnosis += f"1️⃣ <b>get_current_prompt():</b>\n"
+        diagnosis += f"   Пункт 6: {'✅' if has_point6 else '❌'}\n"
+        diagnosis += f"   Эмодзи 👄: {'✅' if has_emoji_heart else '❌'}\n"
+        diagnosis += f"   Длина: {len(current)}\n\n"
+    except Exception as e:
+        diagnosis += f"1️⃣ <b>get_current_prompt():</b> ❌ {e}\n\n"
+    
+    # 2. Проверяем PostgreSQL напрямую
+    try:
+        from database import execute_query
+        result = execute_query("SELECT prompt_text FROM current_prompt ORDER BY id DESC LIMIT 1", fetch='one')
+        if result:
+            pg_prompt = result[0]
+            has_point6 = "6." in pg_prompt and "структурирования информации" in pg_prompt
+            has_emoji_heart = "👄" in pg_prompt
+            diagnosis += f"2️⃣ <b>PostgreSQL прямой запрос:</b>\n"
+            diagnosis += f"   Пункт 6: {'✅' if has_point6 else '❌'}\n"
+            diagnosis += f"   Эмодзи 👄: {'✅' if has_emoji_heart else '❌'}\n"
+            diagnosis += f"   Длина: {len(pg_prompt)}\n\n"
+        else:
+            diagnosis += "2️⃣ <b>PostgreSQL:</b> ❌ Промпт не найден\n\n"
+    except Exception as e:
+        diagnosis += f"2️⃣ <b>PostgreSQL:</b> ❌ {e}\n\n"
+    
+    # 3. Проверяем SQLite напрямую
+    try:
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT prompt_text FROM current_prompt ORDER BY id DESC LIMIT 1")
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            sq_prompt = result[0]
+            has_point6 = "6." in sq_prompt and "структурирования информации" in sq_prompt
+            has_emoji_heart = "👄" in sq_prompt
+            diagnosis += f"3️⃣ <b>SQLite прямой запрос:</b>\n"
+            diagnosis += f"   Пункт 6: {'✅' if has_point6 else '❌'}\n"
+            diagnosis += f"   Эмодзи 👄: {'✅' if has_emoji_heart else '❌'}\n"
+            diagnosis += f"   Длина: {len(sq_prompt)}\n\n"
+        else:
+            diagnosis += "3️⃣ <b>SQLite:</b> ❌ Промпт не найден\n\n"
+    except Exception as e:
+        diagnosis += f"3️⃣ <b>SQLite:</b> ❌ {e}\n\n"
+    
+    # 4. Проверяем что происходит при анализе сообщения
+    try:
+        test_prompt = get_current_prompt()
+        formatted = test_prompt.format(message_text="ТЕСТ")
+        has_point6_formatted = "6." in formatted and "структурирования информации" in formatted
+        diagnosis += f"4️⃣ <b>При анализе сообщений используется:</b>\n"
+        diagnosis += f"   Пункт 6: {'✅' if has_point6_formatted else '❌'}\n"
+        diagnosis += f"   Длина: {len(formatted)}\n\n"
+    except Exception as e:
+        diagnosis += f"4️⃣ <b>Анализ сообщений:</b> ❌ {e}\n\n"
+    
+    # Разбиваем на части если длинное
+    if len(diagnosis) > 4000:
+        await message.reply(diagnosis[:4000] + "\n\n...(продолжение)", parse_mode='HTML')
+        await message.reply(diagnosis[4000:], parse_mode='HTML')
+    else:
+        await message.reply(diagnosis, parse_mode='HTML')
+
 @dp.message(Command("logs"))
 async def show_action_logs(message: types.Message):
     """Показать последние действия"""
@@ -1596,6 +1675,7 @@ async def main():
         BotCommand(command="setprompt", description="🔧 Установить правильный промпт (админ)"),
         BotCommand(command="compare", description="🔍 Сравнить промпты в базах (админ)"),
         BotCommand(command="sync", description="🔄 Синхронизировать промпты (админ)"),
+        BotCommand(command="diagnose", description="🔍 Полная диагностика промптов (админ)"),
         BotCommand(command="logs", description="📝 Логи действий (админ)"),
         BotCommand(command="cancel", description="❌ Отменить редактирование (админ)")
     ]
