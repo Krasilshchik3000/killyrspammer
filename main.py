@@ -1148,6 +1148,37 @@ async def full_prompt_diagnosis(message: types.Message):
     else:
         await message.reply(diagnosis, parse_mode='HTML')
 
+@dp.message(Command("debug"))
+async def debug_prompt_issue(message: types.Message):
+    """Отладка проблемы с промптами - показать точное содержимое"""
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("❌ Команда только для администратора")
+        return
+    
+    # Получаем промпт и показываем ключевые части
+    current = get_current_prompt()
+    
+    # Ищем пункт 6
+    if "6." in current:
+        start = current.find("6.")
+        point6_text = current[start:start+100]
+        debug_info = f"🔍 <b>ОТЛАДКА ПРОМПТА:</b>\n\n✅ Пункт 6 найден:\n<code>{point6_text}...</code>\n\n"
+    else:
+        debug_info = f"🔍 <b>ОТЛАДКА ПРОМПТА:</b>\n\n❌ Пункт 6 НЕ НАЙДЕН!\n\n"
+    
+    # Ищем эмодзи 👄
+    if "👄" in current:
+        heart_pos = current.find("👄")
+        heart_context = current[max(0, heart_pos-50):heart_pos+50]
+        debug_info += f"✅ Эмодзи 👄 найдено:\n<code>{heart_context}</code>\n\n"
+    else:
+        debug_info += "❌ Эмодзи 👄 НЕ НАЙДЕНО!\n\n"
+    
+    # Показываем последние 200 символов промпта
+    debug_info += f"📝 <b>Конец промпта:</b>\n<code>{current[-200:]}</code>"
+    
+    await message.reply(debug_info, parse_mode='HTML')
+
 @dp.message(Command("logs"))
 async def show_action_logs(message: types.Message):
     """Показать последние действия"""
