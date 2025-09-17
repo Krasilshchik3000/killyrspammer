@@ -273,6 +273,91 @@ def save_new_prompt(prompt_text: str, reason: str):
     else:
         logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Промпт не сохранен НИГДЕ!")
 
+async def verify_and_report_prompt_sync(expected_prompt: str, admin_id: int):
+    """Реально проверить синхронизацию промпта и отправить отчет в чат"""
+    
+    report = "📊 <b>ПРОВЕРКА СИНХРОНИЗАЦИИ ПРОМПТА:</b>\n\n"
+    
+    # Проверяем PostgreSQL
+    postgresql_prompt = None
+    try:
+        from database import execute_query
+        result = execute_query("SELECT prompt_text FROM current_prompt ORDER BY id DESC LIMIT 1", fetch='one')
+        if result:
+            postgresql_prompt = result[0]
+            if postgresql_prompt == expected_prompt:
+                report += "🗄️ <b>PostgreSQL:</b> ✅ СИНХРОНИЗИРОВАН\n"
+            else:
+                report += "🗄️ <b>PostgreSQL:</b> ❌ НЕ СОВПАДАЕТ\n"
+        else:
+            report += "🗄️ <b>PostgreSQL:</b> ❌ НЕ НАЙДЕН\n"
+            postgresql_prompt = "НЕ НАЙДЕН"
+    except Exception as e:
+        report += f"🗄️ <b>PostgreSQL:</b> ❌ ОШИБКА - {e}\n"
+        postgresql_prompt = f"ОШИБКА: {e}"
+    
+    # Проверяем SQLite
+    sqlite_prompt = None
+    try:
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT prompt_text FROM current_prompt ORDER BY id DESC LIMIT 1")
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            sqlite_prompt = result[0]
+            if sqlite_prompt == expected_prompt:
+                report += "💾 <b>SQLite:</b> ✅ СИНХРОНИЗИРОВАН\n"
+            else:
+                report += "💾 <b>SQLite:</b> ❌ НЕ СОВПАДАЕТ\n"
+        else:
+            report += "💾 <b>SQLite:</b> ❌ НЕ НАЙДЕН\n"
+            sqlite_prompt = "НЕ НАЙДЕН"
+    except Exception as e:
+        report += f"💾 <b>SQLite:</b> ❌ ОШИБКА - {e}\n"
+        sqlite_prompt = f"ОШИБКА: {e}"
+    
+    # Проверяем функцию get_current_prompt()
+    try:
+        current_prompt = get_current_prompt()
+        if current_prompt == expected_prompt:
+            report += "🎯 <b>get_current_prompt():</b> ✅ ВОЗВРАЩАЕТ ПРАВИЛЬНЫЙ\n"
+        else:
+            report += "🎯 <b>get_current_prompt():</b> ❌ ВОЗВРАЩАЕТ НЕПРАВИЛЬНЫЙ\n"
+    except Exception as e:
+        report += f"🎯 <b>get_current_prompt():</b> ❌ ОШИБКА - {e}\n"
+        current_prompt = f"ОШИБКА: {e}"
+    
+    # Итоговый статус
+    all_synced = (
+        postgresql_prompt == expected_prompt and 
+        sqlite_prompt == expected_prompt and 
+        current_prompt == expected_prompt
+    )
+    
+    if all_synced:
+        report += "\n🎉 <b>РЕЗУЛЬТАТ: ВСЕ ПРОМПТЫ СИНХРОНИЗИРОВАНЫ!</b>"
+        await bot.send_message(admin_id, report, parse_mode='HTML')
+    else:
+        report += "\n🚨 <b>РЕЗУЛЬТАТ: ОБНАРУЖЕНЫ РАЗЛИЧИЯ!</b>\n\n"
+        
+        # Показываем различия
+        if postgresql_prompt != expected_prompt:
+            report += f"❌ <b>PostgreSQL отличается:</b>\n<code>{postgresql_prompt[:300]}{'...' if len(postgresql_prompt) > 300 else ''}</code>\n\n"
+        
+        if sqlite_prompt != expected_prompt:
+            report += f"❌ <b>SQLite отличается:</b>\n<code>{sqlite_prompt[:300]}{'...' if len(sqlite_prompt) > 300 else ''}</code>\n\n"
+        
+        report += f"✅ <b>Ожидаемый промпт:</b>\n<code>{expected_prompt[:300]}{'...' if len(expected_prompt) > 300 else ''}</code>"
+        
+        # Разбиваем на части если слишком длинное
+        if len(report) > 4000:
+            await bot.send_message(admin_id, report[:4000] + "\n\n...(продолжение)", parse_mode='HTML')
+            await bot.send_message(admin_id, report[4000:], parse_mode='HTML')
+        else:
+            await bot.send_message(admin_id, report, parse_mode='HTML')
+
 def get_recent_mistakes(limit=10):
     """Получить недавние ошибки бота для улучшения промпта"""
     try:
@@ -1075,30 +1160,20 @@ async def handle_admin_text(message: types.Message):
         
         # Сохраняем новый промпт
         logger.info(f"💾 Сохраняю новый промпт от админа (длина: {len(message.text)} символов)")
-        save_new_prompt(message.text, "Ручное редактирование администратором")
         
         # Сбрасываем состояние в БД
         set_bot_state(ADMIN_ID, awaiting_prompt_edit=False)
         awaiting_prompt_edit = False
         pending_prompt = None
         
-        # Получаем информацию о новом промпте
-        try:
-            from database import execute_query
-            result = execute_query("SELECT improvement_reason, updated_at FROM current_prompt ORDER BY id DESC LIMIT 1", fetch='one')
-            if result:
-                reason, created_at = result
-                result = (1, reason, created_at)  # Фейковая версия для совместимости
-        except:
-            result = (1, reason, datetime.now())
+        # Отправляем уведомление о начале процесса
+        await message.reply("🔄 Сохраняю и синхронизирую промпт во всех базах...")
         
-        if result:
-            version, reason, created_at = result
-            new_prompt_info = f"✅ <b>Новый промпт сохранен и активирован!</b>\n\n📝 <b>Версия {version}</b>\n\n<code>{message.text}</code>\n\n<b>Изменение:</b> {reason}\n<b>Дата:</b> {created_at}"
-        else:
-            new_prompt_info = f"✅ <b>Новый промпт сохранен и активирован!</b>\n\n<code>{message.text}</code>"
+        # Сохраняем промпт
+        save_new_prompt(message.text, "Ручное редактирование администратором")
         
-        await message.reply(new_prompt_info, parse_mode='HTML')
+        # РЕАЛЬНАЯ ПРОВЕРКА: читаем промпты из всех источников
+        await verify_and_report_prompt_sync(message.text, ADMIN_ID)
     else:
         # Если не в режиме редактирования, обрабатываем как обычное сообщение
         # Передаем дальше в общий обработчик
@@ -1393,12 +1468,21 @@ async def handle_prompt_management(callback: types.CallbackQuery):
     
     if callback.data == "apply_prompt":
         if pending_prompt:
+            # Уведомляем о начале процесса
+            await callback.answer("🔄 Применяю и синхронизирую промпт...")
+            
+            # Сохраняем промпт
             save_new_prompt(pending_prompt, "Автоматическое улучшение на основе ошибок")
+            
+            # Обновляем сообщение
             await callback.message.edit_text(
-                f"{callback.message.text}\n\n✅ <b>Промпт применен!</b>",
+                f"{callback.message.text}\n\n🔄 <b>Промпт применяется и проверяется...</b>",
                 parse_mode='HTML'
             )
-            await callback.answer("✅ Новый промпт активирован!")
+            
+            # РЕАЛЬНАЯ ПРОВЕРКА
+            await verify_and_report_prompt_sync(pending_prompt, ADMIN_ID)
+            
             pending_prompt = None
         else:
             await callback.answer("❌ Нет предложенного промпта")
