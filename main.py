@@ -215,35 +215,36 @@ def get_current_prompt():
     return emergency_prompt
 
 def save_new_prompt(prompt_text: str, reason: str):
-    """Сохранить новый промпт (заменяет предыдущий)"""
+    """Сохранить новый промпт (заменяет предыдущий) ВЕЗДЕ"""
+    logger.info(f"💾 СИНХРОНИЗИРУЮ ПРОМПТ ВО ВСЕХ БАЗАХ:")
+    logger.info(f"   Причина: {reason}")
+    logger.info(f"   Длина: {len(prompt_text)} символов")
+    
+    postgresql_success = False
+    sqlite_success = False
+    
+    # Сохраняем в PostgreSQL
     try:
         from database import execute_query
         
-        # Удаляем ВСЕ старые промпты
         execute_query("DELETE FROM current_prompt")
-        
-        # Добавляем новый промпт (единственный)
         execute_query('''
             INSERT INTO current_prompt (prompt_text, updated_at, improvement_reason)
             VALUES (?, ?, ?)
         ''', (prompt_text, datetime.now(), reason))
         
-        logger.info(f"✅ ПРОМПТ ЗАМЕНЕН В POSTGRESQL:")
-        logger.info(f"   Причина: {reason}")
-        logger.info(f"   Длина: {len(prompt_text)} символов")
-        logger.info(f"   Содержит пункты: {'1.' in prompt_text and '2.' in prompt_text}")
-        logger.info(f"   Содержит исключения: {'Исключения' in prompt_text}")
+        postgresql_success = True
+        logger.info("✅ ПРОМПТ СОХРАНЕН В POSTGRESQL")
         
     except Exception as e:
-        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА СОХРАНЕНИЯ В POSTGRESQL: {e}")
-        
-        # Fallback к SQLite
+        logger.error(f"❌ ОШИБКА СОХРАНЕНИЯ В POSTGRESQL: {e}")
+    
+    # ВСЕГДА сохраняем в SQLite (не только fallback)
+    try:
         conn = sqlite3.connect('antispam.db')
         cursor = conn.cursor()
         
-        # Удаляем все старые
         cursor.execute("DELETE FROM current_prompt")
-        
         cursor.execute('''
             INSERT INTO current_prompt (prompt_text, updated_at, improvement_reason)
             VALUES (?, ?, ?)
@@ -252,7 +253,21 @@ def save_new_prompt(prompt_text: str, reason: str):
         conn.commit()
         conn.close()
         
-        logger.info(f"✅ Промпт заменен через SQLite fallback: {reason}")
+        sqlite_success = True
+        logger.info("✅ ПРОМПТ СОХРАНЕН В SQLITE")
+        
+    except Exception as e:
+        logger.error(f"❌ ОШИБКА СОХРАНЕНИЯ В SQLITE: {e}")
+    
+    # Отчет о результатах
+    if postgresql_success and sqlite_success:
+        logger.info("🎯 ПРОМПТ СИНХРОНИЗИРОВАН ВО ВСЕХ БАЗАХ")
+    elif postgresql_success:
+        logger.warning("⚠️ Промпт сохранен только в PostgreSQL")
+    elif sqlite_success:
+        logger.warning("⚠️ Промпт сохранен только в SQLite")
+    else:
+        logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Промпт не сохранен НИГДЕ!")
 
 def get_recent_mistakes(limit=10):
     """Получить недавние ошибки бота для улучшения промпта"""
@@ -872,6 +887,83 @@ async def set_correct_prompt(message: types.Message):
     except Exception as e:
         await message.reply(f"❌ Ошибка установки промпта: {e}")
 
+@dp.message(Command("compare"))
+async def compare_prompts(message: types.Message):
+    """Сравнить промпты в PostgreSQL и SQLite"""
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("❌ Команда только для администратора")
+        return
+    
+    # Получаем промпт из PostgreSQL
+    postgresql_prompt = None
+    try:
+        from database import execute_query
+        result = execute_query("SELECT prompt_text, improvement_reason, updated_at FROM current_prompt ORDER BY id DESC LIMIT 1", fetch='one')
+        if result:
+            postgresql_prompt, pg_reason, pg_date = result
+        else:
+            postgresql_prompt = None
+    except Exception as e:
+        postgresql_prompt = f"ОШИБКА: {e}"
+    
+    # Получаем промпт из SQLite
+    sqlite_prompt = None
+    try:
+        conn = sqlite3.connect('antispam.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT prompt_text, improvement_reason, updated_at FROM current_prompt ORDER BY id DESC LIMIT 1")
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            sqlite_prompt, sq_reason, sq_date = result
+        else:
+            sqlite_prompt = None
+    except Exception as e:
+        sqlite_prompt = f"ОШИБКА: {e}"
+    
+    # Сравниваем промпты
+    if postgresql_prompt and sqlite_prompt and postgresql_prompt == sqlite_prompt:
+        status = "✅ ПРОМПТЫ ИДЕНТИЧНЫ"
+        comparison = f"📝 <b>{status}</b>\n\n<code>{postgresql_prompt}</code>"
+    else:
+        status = "❌ ПРОМПТЫ РАЗЛИЧАЮТСЯ"
+        comparison = f"🚨 <b>{status}</b>\n\n"
+        
+        if postgresql_prompt:
+            comparison += f"🗄️ <b>PostgreSQL:</b>\n<code>{postgresql_prompt[:500]}{'...' if len(postgresql_prompt) > 500 else ''}</code>\n\n"
+        else:
+            comparison += "🗄️ <b>PostgreSQL:</b> ❌ Не найден\n\n"
+            
+        if sqlite_prompt:
+            comparison += f"💾 <b>SQLite:</b>\n<code>{sqlite_prompt[:500]}{'...' if len(sqlite_prompt) > 500 else ''}</code>"
+        else:
+            comparison += "💾 <b>SQLite:</b> ❌ Не найден"
+    
+    # Разбиваем на части если слишком длинное
+    if len(comparison) > 4000:
+        await message.reply(comparison[:4000] + "\n\n...(обрезано)", parse_mode='HTML')
+        await message.reply(comparison[4000:], parse_mode='HTML')
+    else:
+        await message.reply(comparison, parse_mode='HTML')
+
+@dp.message(Command("sync"))
+async def sync_prompts(message: types.Message):
+    """Синхронизировать промпты между базами"""
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("❌ Команда только для администратора")
+        return
+    
+    await message.reply("🔄 Синхронизирую промпты между базами...")
+    
+    # Получаем текущий промпт
+    current_prompt = get_current_prompt()
+    
+    # Принудительно сохраняем везде
+    save_new_prompt(current_prompt, "ПРИНУДИТЕЛЬНАЯ СИНХРОНИЗАЦИЯ")
+    
+    await message.reply("✅ Промпты синхронизированы во всех базах!")
+
 @dp.message(Command("logs"))
 async def show_action_logs(message: types.Message):
     """Показать последние действия"""
@@ -1390,6 +1482,8 @@ async def main():
         BotCommand(command="version", description="📋 Версия промпта (админ)"),
         BotCommand(command="cleanup", description="🗑️ Очистить старые промпты (админ)"),
         BotCommand(command="setprompt", description="🔧 Установить правильный промпт (админ)"),
+        BotCommand(command="compare", description="🔍 Сравнить промпты в базах (админ)"),
+        BotCommand(command="sync", description="🔄 Синхронизировать промпты (админ)"),
         BotCommand(command="logs", description="📝 Логи действий (админ)"),
         BotCommand(command="cancel", description="❌ Отменить редактирование (админ)")
     ]
