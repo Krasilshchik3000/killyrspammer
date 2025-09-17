@@ -766,33 +766,38 @@ async def show_prompt_version(message: types.Message):
         await message.reply("❌ Команда только для администратора")
         return
     
+    # Получаем полный промпт
+    current_prompt = get_current_prompt()
+    
+    version_info = f"📝 <b>Текущий активный промпт:</b>\n\n<code>{current_prompt}</code>\n\n"
+    
     # Проверяем PostgreSQL
     try:
         from database import execute_query
-        result = execute_query("SELECT improvement_reason, updated_at, substr(prompt_text, 1, 200) FROM current_prompt ORDER BY id DESC LIMIT 1", fetch='one')
+        result = execute_query("SELECT improvement_reason, updated_at FROM current_prompt ORDER BY id DESC LIMIT 1", fetch='one')
         if result:
-            reason, updated_at, prompt_preview = result
-            version_info = f"🗄️ <b>PostgreSQL (основная БД):</b>\n🔄 Изменение: {reason}\n📅 Дата: {updated_at}\n\n<code>{prompt_preview}...</code>"
+            reason, updated_at = result
+            version_info += f"🗄️ <b>PostgreSQL:</b> ✅ Найден\n🔄 Изменение: {reason}\n📅 Дата: {updated_at}"
         else:
-            version_info = "🗄️ <b>PostgreSQL:</b> Промпт не найден"
+            version_info += "🗄️ <b>PostgreSQL:</b> ❌ Промпт не найден"
     except Exception as e:
-        version_info = f"🗄️ <b>PostgreSQL:</b> Ошибка подключения - {e}"
+        version_info += f"🗄️ <b>PostgreSQL:</b> ❌ Ошибка - {e}"
     
     # Проверяем SQLite fallback
     try:
         conn = sqlite3.connect('antispam.db')
         cursor = conn.cursor()
-        cursor.execute("SELECT improvement_reason, updated_at, substr(prompt_text, 1, 200) FROM current_prompt ORDER BY id DESC LIMIT 1")
+        cursor.execute("SELECT improvement_reason, updated_at FROM current_prompt ORDER BY id DESC LIMIT 1")
         result = cursor.fetchone()
         conn.close()
         
         if result:
-            reason, updated_at, prompt_preview = result
-            version_info += f"\n\n💾 <b>SQLite (fallback):</b>\n🔄 Изменение: {reason}\n📅 Дата: {updated_at}\n\n<code>{prompt_preview}...</code>"
+            reason, updated_at = result
+            version_info += f"\n\n💾 <b>SQLite:</b> ✅ Найден\n🔄 Изменение: {reason}\n📅 Дата: {updated_at}"
         else:
-            version_info += "\n\n💾 <b>SQLite:</b> Промпт не найден"
+            version_info += "\n\n💾 <b>SQLite:</b> ❌ Промпт не найден"
     except Exception as e:
-        version_info += f"\n\n💾 <b>SQLite:</b> Ошибка - {e}"
+        version_info += f"\n\n💾 <b>SQLite:</b> ❌ Ошибка - {e}"
     
     await message.reply(version_info, parse_mode='HTML')
 
@@ -826,6 +831,46 @@ async def cleanup_old_prompts(message: types.Message):
     except Exception as e:
         logger.error(f"❌ Ошибка очистки: {e}")
         await message.reply(f"❌ Ошибка очистки: {e}")
+
+@dp.message(Command("setprompt"))
+async def set_correct_prompt(message: types.Message):
+    """Принудительно установить правильный актуальный промпт"""
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("❌ Команда только для администратора")
+        return
+    
+    correct_prompt = """Проанализируй сообщение из телеграм-группы и ответь строго одним из трёх вариантов:
+СПАМ
+НЕ_СПАМ  
+ВОЗМОЖНО_СПАМ
+
+Считай особенно подозрительными: 
+
+1. Безадресные вакансии или предложения быстро заработать деньги 
+2. Призывы писать в личные сообщения, бота или переходить по внешним ссылкам.
+3. Сообщения, содержащие эмодзи 💘/💝/👄 и подобные им.
+4. Предложения заработать или получить деньги
+5. Необоснованное упоминание финансовых операций, криптовалюты, инвестиций.
+6. В сообщении много эмодзи, которые используются не для эмоций, а, например, для структурирования информации
+
+Если сообщение по этим критериям не подходит под спам, но у тебя есть серьезные причины думать, что это спам — выбирай ВОЗМОЖНО_СПАМ.
+
+Исключения и уточнения:
+
+- Не считай спамом аббревиатуры и названия политических партий, даже если они встречаются в подозрительном контексте.
+- Если сообщение содержит только информацию о вакансии без признаков мошенничества (например, указан адрес компании и требования к кандидату), считай его НЕ_СПАМ.
+- Если сообщение содержит ссылку, но она ведет на официальный ресурс без признаков мошенничества (например, на сайт государственной службы), считай его НЕ_СПАМ.
+- Если сообщение короткое и не содержит явных признаков спама, считай его НЕ_СПАМ, даже если данных для анализа мало.
+
+Сообщение: «{message_text}»
+
+Ответ:"""
+    
+    try:
+        save_new_prompt(correct_prompt, "ПРИНУДИТЕЛЬНОЕ ОБНОВЛЕНИЕ АДМИНОМ")
+        await message.reply("✅ Правильный актуальный промпт установлен!")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка установки промпта: {e}")
 
 @dp.message(Command("logs"))
 async def show_action_logs(message: types.Message):
@@ -1344,6 +1389,7 @@ async def main():
         BotCommand(command="groups", description="🔐 Список разрешенных групп (админ)"),
         BotCommand(command="version", description="📋 Версия промпта (админ)"),
         BotCommand(command="cleanup", description="🗑️ Очистить старые промпты (админ)"),
+        BotCommand(command="setprompt", description="🔧 Установить правильный промпт (админ)"),
         BotCommand(command="logs", description="📝 Логи действий (админ)"),
         BotCommand(command="cancel", description="❌ Отменить редактирование (админ)")
     ]
