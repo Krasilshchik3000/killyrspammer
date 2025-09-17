@@ -32,60 +32,7 @@ class SpamResult(Enum):
 
 # СТАРАЯ КОНСТАНТА УДАЛЕНА - теперь промпт только из БД!
 
-def init_database():
-    """Инициализация базы данных"""
-    conn = sqlite3.connect('antispam.db')
-    cursor = conn.cursor()
-    
-    # Таблица сообщений
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY,
-            message_id INTEGER,
-            chat_id INTEGER,
-            user_id INTEGER,
-            username TEXT,
-            text TEXT,
-            created_at TIMESTAMP,
-            llm_result TEXT,
-            admin_decision TEXT,
-            admin_decided_at TIMESTAMP
-        )
-    ''')
-    
-    # Таблица обучающих примеров
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS training_examples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT,
-            is_spam BOOLEAN,
-            source TEXT,
-            created_at TIMESTAMP
-        )
-    ''')
-    
-    # Таблица промптов
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS prompts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            prompt_text TEXT,
-            version INTEGER,
-            created_at TIMESTAMP,
-            is_active BOOLEAN DEFAULT FALSE,
-            improvement_reason TEXT
-        )
-    ''')
-    
-    # Вставляем базовый промпт, если таблица пустая
-    cursor.execute("SELECT COUNT(*) FROM prompts")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute('''
-            INSERT INTO prompts (prompt_text, version, created_at, is_active, improvement_reason)
-            VALUES (?, 1, ?, TRUE, 'Базовый промпт')
-        ''', ("БАЗОВЫЙ_ПРОМПТ_УДАЛЕН", datetime.now()))
-    
-    conn.commit()
-    conn.close()
+# СТАРАЯ ФУНКЦИЯ init_database УДАЛЕНА - используется только database.py
 
 def save_message_to_db(message: types.Message, llm_result: SpamResult = None):
     """Сохранение сообщения в базу данных"""
@@ -822,10 +769,10 @@ async def show_prompt_version(message: types.Message):
     # Проверяем PostgreSQL
     try:
         from database import execute_query
-        result = execute_query("SELECT version, improvement_reason, created_at, substr(prompt_text, 1, 200) FROM prompts WHERE is_active = TRUE", fetch='one')
+        result = execute_query("SELECT improvement_reason, updated_at, substr(prompt_text, 1, 200) FROM current_prompt ORDER BY id DESC LIMIT 1", fetch='one')
         if result:
-            version, reason, created_at, prompt_preview = result
-            version_info = f"🗄️ <b>PostgreSQL (основная БД):</b>\n📝 Версия: {version}\n🔄 Изменение: {reason}\n📅 Дата: {created_at}\n\n<code>{prompt_preview}...</code>"
+            reason, updated_at, prompt_preview = result
+            version_info = f"🗄️ <b>PostgreSQL (основная БД):</b>\n🔄 Изменение: {reason}\n📅 Дата: {updated_at}\n\n<code>{prompt_preview}...</code>"
         else:
             version_info = "🗄️ <b>PostgreSQL:</b> Промпт не найден"
     except Exception as e:
@@ -835,13 +782,13 @@ async def show_prompt_version(message: types.Message):
     try:
         conn = sqlite3.connect('antispam.db')
         cursor = conn.cursor()
-        cursor.execute("SELECT version, improvement_reason, created_at, substr(prompt_text, 1, 200) FROM prompts WHERE is_active = TRUE")
+        cursor.execute("SELECT improvement_reason, updated_at, substr(prompt_text, 1, 200) FROM current_prompt ORDER BY id DESC LIMIT 1")
         result = cursor.fetchone()
         conn.close()
         
         if result:
-            version, reason, created_at, prompt_preview = result
-            version_info += f"\n\n💾 <b>SQLite (fallback):</b>\n📝 Версия: {version}\n🔄 Изменение: {reason}\n📅 Дата: {created_at}\n\n<code>{prompt_preview}...</code>"
+            reason, updated_at, prompt_preview = result
+            version_info += f"\n\n💾 <b>SQLite (fallback):</b>\n🔄 Изменение: {reason}\n📅 Дата: {updated_at}\n\n<code>{prompt_preview}...</code>"
         else:
             version_info += "\n\n💾 <b>SQLite:</b> Промпт не найден"
     except Exception as e:
