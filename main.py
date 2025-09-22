@@ -1779,18 +1779,25 @@ async def main():
     """Запуск бота"""
     global openai_client, bot
     
+    logger.info("🚀 Начинаю инициализацию бота...")
+    
     # Проверяем наличие необходимых переменных окружения
+    logger.info("🔍 Проверяю переменные окружения...")
+    
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN не найден в переменных окружения!")
         return
+    logger.info("✅ BOT_TOKEN найден")
     
     if not OPENAI_API_KEY:
         logger.error("❌ OPENAI_API_KEY не найден в переменных окружения!")
         return
+    logger.info("✅ OPENAI_API_KEY найден")
     
     if ADMIN_ID == 0:
         logger.error("❌ ADMIN_ID не найден в переменных окружения!")
         return
+    logger.info(f"✅ ADMIN_ID: {ADMIN_ID}")
     
     # Инициализация бота
     try:
@@ -1871,4 +1878,9 @@ if __name__ == "__main__":
         print("🛑 Для остановки нажмите Ctrl+C")
         print("=" * 60)
     
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА: {e}")
+        import traceback
+        traceback.print_exc()
