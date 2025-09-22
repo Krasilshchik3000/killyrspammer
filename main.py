@@ -535,9 +535,71 @@ async def send_suspicious_message_to_admin(message: types.Message, result: SpamR
         )
         logger.info(f"✅ Сообщение отправлено админу (ID: {sent_message.message_id})")
         
-    except Exception as e:
+        except Exception as e:
         logger.error(f"❌ Ошибка отправки админу: {e}")
 
+async def ban_spammer_and_delete(message: types.Message, spam_result: SpamResult):
+    """Забанить спамера и удалить сообщение"""
+    try:
+        # Удаляем сообщение
+        await bot.delete_message(message.chat.id, message.message_id)
+        logger.info(f"🗑️ Удалено спам-сообщение {message.message_id}")
+        
+        # Баним пользователя
+        await bot.ban_chat_member(
+            chat_id=message.chat.id,
+            user_id=message.from_user.id
+        )
+        logger.info(f"🔨 Забанен спамер {message.from_user.id} (@{message.from_user.username})")
+        
+        # Отправляем отчет админу с кнопкой разбана
+        await send_ban_report_to_admin(message, spam_result)
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка бана/удаления: {e}")
+        
+        # Если не удалось забанить, отправляем как обычно админу
+        await send_suspicious_message_to_admin(message, spam_result)
+        return False
+
+async def send_ban_report_to_admin(message: types.Message, result: SpamResult):
+    """Отправка отчета о бане админу"""
+    ban_emoji = "🔴"
+    
+    admin_text = f"""{ban_emoji} <b>АВТОБАН ЗА СПАМ</b>
+
+<b>👤 Забанен:</b> {message.from_user.full_name} (@{message.from_user.username or 'нет username'})
+<b>🆔 User ID:</b> <code>{message.from_user.id}</code>
+<b>📍 Группа:</b> {message.chat.title}
+<b>🕐 Время:</b> {message.date.strftime('%H:%M:%S')}
+<b>🤖 Определено как:</b> {result.value}
+
+<b>📝 Удаленное сообщение:</b>
+<code>{message.text}</code>
+
+<b>⚡ Действия выполнены:</b>
+✅ Сообщение удалено
+✅ Пользователь забанен"""
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🟢 НЕ СПАМ (разбанить)", callback_data=f"unban_{message.from_user.id}_{message.chat.id}_{message.message_id}")
+        ]
+    ])
+    
+    try:
+        await bot.send_message(
+            ADMIN_ID, 
+            admin_text, 
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+        logger.info(f"✅ Отчет о бане отправлен админу")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки отчета о бане: {e}")
 
 async def analyze_bot_error(message_text: str, error_type: str):
     """Анализ ошибки бота через ChatGPT"""
@@ -1414,12 +1476,23 @@ async def handle_message(message: types.Message):
     except Exception as e:
         logger.error(f"❌ Ошибка backup: {e}")
     
-    # Если подозрительное - отправляем админу
-    if spam_result in [SpamResult.SPAM, SpamResult.MAYBE_SPAM]:
-        logger.info(f"🚨 Подозрительное сообщение ({spam_result.value}), отправляю админу...")
+    # Обрабатываем результат анализа
+    if spam_result == SpamResult.SPAM:
+        # СПАМ - автоматически баним и удаляем
+        logger.info(f"🚨 ОБНАРУЖЕН СПАМ! Автоматически баню и удаляю...")
+        ban_success = await ban_spammer_and_delete(message, spam_result)
+        
+        if not ban_success:
+            logger.warning("⚠️ Не удалось забанить, отправляю админу как обычно")
+            
+    elif spam_result == SpamResult.MAYBE_SPAM:
+        # ВОЗМОЖНО СПАМ - отправляем админу для проверки
+        logger.info(f"🟡 Возможно спам, отправляю админу для проверки...")
         await send_suspicious_message_to_admin(message, spam_result)
+        
     else:
-        logger.info(f"✅ Сообщение чистое ({spam_result.value}), не отправляю админу")
+        # НЕ СПАМ - ничего не делаем
+        logger.info(f"✅ Сообщение чистое ({spam_result.value})")
 
 @dp.callback_query(F.data.startswith("spam_") | F.data.startswith("not_spam_"))
 async def handle_admin_feedback(callback: types.CallbackQuery):
@@ -1631,6 +1704,73 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
     else:
         logger.info(f"ℹ️ Не ошибка бота: action={action}, llm_result={llm_result}")
         await callback.answer(f"✅ Отмечено как {decision}")
+
+@dp.callback_query(F.data.startswith("unban_"))
+async def handle_unban_request(callback: types.CallbackQuery):
+    """Обработка запроса на разбан (кнопка НЕ СПАМ под автобаном)"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Только для администратора")
+        return
+    
+    try:
+        # Парсим данные: unban_user_id_chat_id_message_id
+        parts = callback.data.split("_")
+        user_id = int(parts[1])
+        chat_id = int(parts[2])
+        original_message_id = int(parts[3])
+        
+        logger.info(f"🔄 Запрос на разбан: user_id={user_id}, chat_id={chat_id}")
+        
+        # Разбаниваем пользователя
+        await bot.unban_chat_member(chat_id=chat_id, user_id=user_id)
+        logger.info(f"✅ Пользователь {user_id} разбанен")
+        
+        # Извлекаем текст сообщения из отчета
+        original_text = callback.message.text
+        import re
+        code_match = re.search(r'<code>(.*?)</code>', original_text, re.DOTALL)
+        
+        if code_match:
+            message_text = code_match.group(1).strip()
+            
+            # Обновляем отчет
+            new_text = f"{original_text}\n\n🟢 <b>ПОЛЬЗОВАТЕЛЬ РАЗБАНЕН</b>\n⏳ Анализирую ошибку бота..."
+            await callback.message.edit_text(new_text, parse_mode='HTML')
+            
+            # Анализируем ошибку бота (он неправильно определил как спам)
+            analysis, improved_prompt = await analyze_bot_error(message_text, "false_positive")
+            
+            if improved_prompt:
+                # Отправляем предложение улучшенного промпта
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✅ Применить", callback_data="apply_prompt"),
+                        InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_prompt"),
+                        InlineKeyboardButton(text="❌ Отклонить", callback_data="reject_prompt")
+                    ]
+                ])
+                
+                global pending_prompt
+                pending_prompt = improved_prompt
+                
+                prompt_message = f"""🤖 <b>Анализ ошибки автобана:</b>
+
+<b>Ошибка:</b> Бот неправильно забанил пользователя
+<b>Сообщение:</b> "{message_text}"
+
+{analysis}
+
+<code>{improved_prompt}</code>"""
+                
+                await bot.send_message(ADMIN_ID, prompt_message, reply_markup=keyboard, parse_mode='HTML')
+            
+            await callback.answer("✅ Пользователь разбанен, ошибка проанализирована")
+        else:
+            await callback.answer("✅ Пользователь разбанен")
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка разбана: {e}")
+        await callback.answer(f"❌ Ошибка разбана: {e}")
 
 @dp.callback_query(F.data.in_(["apply_prompt", "edit_prompt", "reject_prompt", "edit_current_prompt"]))
 async def handle_prompt_management(callback: types.CallbackQuery):
