@@ -481,7 +481,7 @@ async def send_suspicious_message_to_admin(message: types.Message, result: SpamR
         )
         logger.info(f"✅ Сообщение отправлено админу (ID: {sent_message.message_id})")
         
-        except Exception as e:
+    except Exception as e:
         logger.error(f"❌ Ошибка отправки админу: {e}")
 
 async def ban_spammer_and_delete(message: types.Message, spam_result: SpamResult):
