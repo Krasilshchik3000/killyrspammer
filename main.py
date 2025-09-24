@@ -1841,10 +1841,10 @@ async def main():
         return
     logger.info("✅ OPENAI_API_KEY найден")
     
-    if ADMIN_ID == 0:
-        logger.error("❌ ADMIN_ID не найден в переменных окружения!")
-        return
-    logger.info(f"✅ ADMIN_ID: {ADMIN_ID}")
+    if ADMIN_ID == -1:
+        logger.warning("⚠️ ADMIN_ID не установлен - функции администратора отключены")
+    else:
+        logger.info(f"✅ ADMIN_ID: {ADMIN_ID}")
     
     # Инициализация бота
     try:
