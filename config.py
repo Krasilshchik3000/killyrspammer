@@ -14,7 +14,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # ID администратора
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID") or "0")
+
+# Проверяем что ADMIN_ID установлен корректно
+if ADMIN_ID <= 0:
+    raise ValueError("ADMIN_ID должен быть положительным числом! Установите корректный ADMIN_ID в переменных окружения.")
 
 # Белый список групп (только эти группы будут обрабатываться)
 ALLOWED_GROUP_IDS = [

@@ -25,6 +25,12 @@ pending_prompt = None
 awaiting_prompt_edit = False
 openai_client = None
 
+# Rate limiting для защиты от DoS атак на OpenAI API
+from collections import defaultdict
+import time
+user_request_times = defaultdict(list)  # {user_id: [timestamps]}
+MAX_REQUESTS_PER_MINUTE = 5  # Максимум 5 запросов в минуту на пользователя
+
 class SpamResult(Enum):
     SPAM = "СПАМ"
     NOT_SPAM = "НЕ_СПАМ"  
@@ -410,20 +416,42 @@ async def improve_prompt_with_ai(mistakes):
         logger.error(f"Ошибка улучшения промпта: {e}")
         return None
 
-async def check_message_with_llm(message_text: str) -> SpamResult:
+def check_rate_limit(user_id: int) -> bool:
+    """Проверка rate limit для пользователя"""
+    current_time = time.time()
+    minute_ago = current_time - 60
+    
+    # Удаляем старые запросы (старше минуты)
+    user_request_times[user_id] = [t for t in user_request_times[user_id] if t > minute_ago]
+    
+    # Проверяем лимит
+    if len(user_request_times[user_id]) >= MAX_REQUESTS_PER_MINUTE:
+        logger.warning(f"⚠️ Rate limit превышен для пользователя {user_id}")
+        return False
+    
+    # Записываем новый запрос
+    user_request_times[user_id].append(current_time)
+    return True
+
+async def check_message_with_llm(message_text: str, user_id: int = None) -> SpamResult:
     """Проверка сообщения через LLM"""
+    
+    # Проверяем rate limit если указан user_id
+    if user_id and not check_rate_limit(user_id):
+        logger.warning(f"🚫 Rate limit превышен для {user_id} - возвращаю MAYBE_SPAM")
+        return SpamResult.MAYBE_SPAM
+    
     current_prompt = get_current_prompt()
     
-    # КРИТИЧЕСКОЕ ЛОГИРОВАНИЕ: какой промпт используется для анализа
-    logger.info(f"🎯 ИСПОЛЬЗУЕТСЯ ПРОМПТ ДЛЯ АНАЛИЗА:")
-    logger.info(f"   Содержит пункты 1-5: {'1.' in current_prompt and '2.' in current_prompt}")
-    logger.info(f"   Содержит исключения: {'Исключения' in current_prompt}")
-    logger.info(f"   Длина: {len(current_prompt)} символов")
+    logger.info(f"🎯 Анализирую сообщение длиной {len(message_text)} символов")
+    logger.info(f"   Промпт загружен, длина: {len(current_prompt)} символов")
     
-    prompt = current_prompt.format(message_text=message_text)
+    # Защита от Prompt Injection - экранируем спецсимволы
+    safe_message_text = message_text.replace("{", "{{").replace("}", "}}")
+    prompt = current_prompt.format(message_text=safe_message_text)
     
-    logger.info(f"🤖 Отправляю в ChatGPT: '{message_text[:50]}...'")
-    logger.debug(f"📝 Полный промпт: {prompt}")
+    logger.info(f"🤖 Отправляю в ChatGPT сообщение длиной {len(message_text)} символов")
+    # НЕ логируем полный промпт с пользовательскими данными
     
     try:
         response = await openai_client.chat.completions.create(
@@ -1359,7 +1387,7 @@ async def handle_message(message: types.Message):
     """Основная обработка сообщений"""
     # Логируем все сообщения для отладки
     logger.info(f"🔍 ПОЛУЧЕНО СООБЩЕНИЕ: от {message.from_user.id} (@{message.from_user.username}) в чате '{message.chat.title}' (тип: {message.chat.type}, ID: {message.chat.id})")
-    logger.info(f"📝 Текст: '{message.text[:100]}...'")
+    logger.info(f"📝 Длина текста: {len(message.text)} символов")
     
     # Пропускаем сообщения от бота
     if message.from_user.is_bot:
@@ -1383,10 +1411,10 @@ async def handle_message(message: types.Message):
     if message.text and message.text.startswith('/'):
         return
         
-    logger.info(f"Проверяю сообщение от {message.from_user.username}: {message.text[:50]}...")
+    logger.info(f"Проверяю сообщение от {message.from_user.username}: длина {len(message.text)} символов")
     
-    # Проверяем через LLM
-    spam_result = await check_message_with_llm(message.text)
+    # Проверяем через LLM с rate limiting
+    spam_result = await check_message_with_llm(message.text, message.from_user.id)
     
     # Логируем анализ сообщения
     try:
@@ -1450,14 +1478,26 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
         logger.warning(f"⚠️ Неавторизованный доступ к кнопке от {callback.from_user.id}")
         return
     
-    if callback.data.startswith("not_spam_"):
-        action = "not_spam"
-        message_id = int(callback.data.replace("not_spam_", ""))
-    elif callback.data.startswith("spam_"):
-        action = "spam"
-        message_id = int(callback.data.replace("spam_", ""))
-    else:
-        await callback.answer("❌ Неизвестная команда")
+    # Безопасный парсинг callback_data с валидацией
+    try:
+        if callback.data.startswith("not_spam_"):
+            action = "not_spam"
+            message_id_str = callback.data.replace("not_spam_", "")
+            message_id = int(message_id_str)
+            if message_id <= 0:
+                raise ValueError("Invalid message_id")
+        elif callback.data.startswith("spam_"):
+            action = "spam"  
+            message_id_str = callback.data.replace("spam_", "")
+            message_id = int(message_id_str)
+            if message_id <= 0:
+                raise ValueError("Invalid message_id")
+        else:
+            await callback.answer("❌ Неизвестная команда")
+            return
+    except (ValueError, TypeError) as e:
+        logger.warning(f"⚠️ Некорректный callback_data: {callback.data}")
+        await callback.answer("❌ Некорректный ID сообщения")
         return
     
     logger.info(f"🔍 Обработка кнопки: action={action}, message_id={message_id}")
@@ -1659,11 +1699,18 @@ async def handle_unban_request(callback: types.CallbackQuery):
         return
     
     try:
-        # Парсим данные: unban_user_id_chat_id_message_id
+        # Безопасный парсинг данных: unban_user_id_chat_id_message_id
         parts = callback.data.split("_")
+        if len(parts) != 4:
+            raise ValueError("Invalid callback format")
+        
         user_id = int(parts[1])
         chat_id = int(parts[2])
         original_message_id = int(parts[3])
+        
+        # Валидация значений
+        if user_id <= 0 or chat_id >= 0 or original_message_id <= 0:
+            raise ValueError("Invalid IDs")
         
         logger.info(f"🔄 Запрос на разбан: user_id={user_id}, chat_id={chat_id}")
         
