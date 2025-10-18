@@ -512,22 +512,108 @@ async def send_suspicious_message_to_admin(message: types.Message, result: SpamR
     except Exception as e:
         logger.error(f"❌ Ошибка отправки админу: {e}")
 
-async def ban_spammer_and_delete(message: types.Message, spam_result: SpamResult):
-    """Забанить спамера и удалить сообщение"""
+async def is_channel_or_channel_author(message: types.Message) -> bool:
+    """Проверить, является ли сообщение от канала или его автора"""
     try:
-        # Удаляем сообщение
-        await bot.delete_message(message.chat.id, message.message_id)
+        # Проверяем, является ли сообщение от канала
+        if message.from_user.is_bot and message.sender_chat:
+            logger.info(f"📢 Сообщение от канала: {message.sender_chat.title} (ID: {message.sender_chat.id})")
+            return True
+        
+        # Проверяем, является ли пользователь автором канала
+        if message.sender_chat and message.sender_chat.type == "channel":
+            logger.info(f"👤 Автор канала: {message.sender_chat.title}")
+            return True
+            
+        return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки канала: {e}")
+        return False
+
+async def has_user_recent_activity(user_id: int, chat_id: int, minutes: int = 10) -> bool:
+    """Проверить, есть ли у пользователя активность в чате за последние N минут"""
+    try:
+        from database import execute_query, DATABASE_URL
+        
+        # Ищем сообщения пользователя в этом чате за последние N минут
+        if DATABASE_URL:
+            # PostgreSQL
+            result = execute_query('''
+                SELECT COUNT(*) FROM messages 
+                WHERE user_id = %s AND chat_id = %s 
+                AND created_at > NOW() - INTERVAL '%s minutes'
+            ''' % (user_id, chat_id, minutes), fetch='one')
+        else:
+            # SQLite
+            result = execute_query('''
+                SELECT COUNT(*) FROM messages 
+                WHERE user_id = ? AND chat_id = ? 
+                AND created_at > datetime('now', '-{} minutes')
+            '''.format(minutes), (user_id, chat_id), fetch='one')
+        
+        if result and result[0] > 0:
+            logger.info(f"✅ Пользователь {user_id} имел активность в чате {chat_id} за последние {minutes} минут")
+            return True
+            
+        logger.info(f"❌ Пользователь {user_id} НЕ имел активности в чате {chat_id} за последние {minutes} минут")
+        return False
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки активности пользователя: {e}")
+        return False
+
+async def ban_user_in_all_groups(user_id: int, original_chat_id: int, message_text: str):
+    """Забанить пользователя во всех мониторимых группах"""
+    from config import ALLOWED_GROUP_IDS
+    
+    banned_groups = []
+    failed_groups = []
+    
+    for group_id in ALLOWED_GROUP_IDS:
+        if group_id == original_chat_id:
+            continue  # Пропускаем группу, где уже забанен
+            
+        try:
+            await bot.ban_chat_member(chat_id=group_id, user_id=user_id)
+            banned_groups.append(group_id)
+            logger.info(f"🔨 Пользователь {user_id} забанен в группе {group_id}")
+        except Exception as e:
+            failed_groups.append((group_id, str(e)))
+            logger.warning(f"⚠️ Не удалось забанить {user_id} в группе {group_id}: {e}")
+    
+    return banned_groups, failed_groups
+
+async def ban_spammer_and_delete(message: types.Message, spam_result: SpamResult):
+    """Забанить спамера и удалить сообщение с улучшенной логикой"""
+    try:
+        user_id = message.from_user.id
+        chat_id = message.chat.id
+        
+        # 1. Проверяем, не является ли это каналом или автором канала
+        if await is_channel_or_channel_author(message):
+            logger.info(f"🚫 Пропускаем бан канала/автора канала: {message.from_user.id}")
+            await send_suspicious_message_to_admin(message, spam_result)
+            return False
+        
+        # 2. Проверяем качество пользователя - если писал раньше 10 минут назад, не баним
+        if await has_user_recent_activity(user_id, chat_id, 10):
+            logger.info(f"🚫 Пропускаем бан пользователя {user_id} - имел активность в чате")
+            await send_suspicious_message_to_admin(message, spam_result)
+            return False
+        
+        # 3. Удаляем сообщение
+        await bot.delete_message(chat_id, message.message_id)
         logger.info(f"🗑️ Удалено спам-сообщение {message.message_id}")
         
-        # Баним пользователя
-        await bot.ban_chat_member(
-            chat_id=message.chat.id,
-            user_id=message.from_user.id
-        )
-        logger.info(f"🔨 Забанен спамер {message.from_user.id} (@{message.from_user.username})")
+        # 4. Баним пользователя в текущей группе
+        await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+        logger.info(f"🔨 Забанен спамер {user_id} (@{message.from_user.username}) в группе {chat_id}")
         
-        # Отправляем отчет админу с кнопкой разбана
-        await send_ban_report_to_admin(message, spam_result)
+        # 5. Баним пользователя во всех мониторимых группах
+        banned_groups, failed_groups = await ban_user_in_all_groups(user_id, chat_id, message.text)
+        
+        # 6. Отправляем отчет админу с кнопкой разбана
+        await send_ban_report_to_admin(message, spam_result, banned_groups, failed_groups)
         
         return True
         
@@ -538,7 +624,7 @@ async def ban_spammer_and_delete(message: types.Message, spam_result: SpamResult
         await send_suspicious_message_to_admin(message, spam_result)
         return False
 
-async def send_ban_report_to_admin(message: types.Message, result: SpamResult):
+async def send_ban_report_to_admin(message: types.Message, result: SpamResult, banned_groups=None, failed_groups=None):
     """Отправка отчета о бане админу"""
     ban_emoji = "🔴"
     
@@ -555,7 +641,14 @@ async def send_ban_report_to_admin(message: types.Message, result: SpamResult):
 
 <b>⚡ Действия выполнены:</b>
 ✅ Сообщение удалено
-✅ Пользователь забанен"""
+✅ Пользователь забанен в группе {message.chat.title}"""
+
+    # Добавляем информацию о банах в других группах
+    if banned_groups:
+        admin_text += f"\n✅ Забанен в {len(banned_groups)} дополнительных группах"
+    
+    if failed_groups:
+        admin_text += f"\n⚠️ Не удалось забанить в {len(failed_groups)} группах"
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -1568,9 +1661,41 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
     # Добавляем в обучающие примеры
     add_training_example(message_text, is_spam, 'ADMIN_FEEDBACK')
     
-    # Обновляем сообщение
-    decision_emoji = "❌" if is_spam else "✅"
-    new_text = f"{callback.message.text}\n\n{decision_emoji} <b>Решение: {decision}</b>"
+    # Если нажали СПАМ на ВОЗМОЖНО_СПАМ - баним пользователя
+    if action == "spam" and llm_result == 'ВОЗМОЖНО_СПАМ':
+        logger.info(f"🔨 АДМИН ПОДТВЕРДИЛ СПАМ - баним пользователя")
+        
+        # Получаем user_id из базы данных
+        try:
+            from database import execute_query
+            user_result = execute_query(
+                "SELECT user_id FROM messages WHERE message_id = ?", 
+                (message_id,), fetch='one'
+            )
+            
+            if user_result:
+                user_id = user_result[0]
+                
+                # Баним пользователя во всех группах
+                banned_groups, failed_groups = await ban_user_in_all_groups(user_id, callback.message.chat.id, message_text)
+                
+                decision_emoji = "🔴"
+                ban_info = f"Забанен в {len(banned_groups) + 1} группах"
+                if failed_groups:
+                    ban_info += f" (не удалось в {len(failed_groups)})"
+                new_text = f"{callback.message.text}\n\n{decision_emoji} <b>Решение: СПАМ - Пользователь забанен</b>\n📊 {ban_info}"
+            else:
+                decision_emoji = "❌"
+                new_text = f"{callback.message.text}\n\n{decision_emoji} <b>Решение: СПАМ (не найден user_id)</b>"
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка бана пользователя: {e}")
+            decision_emoji = "❌"
+            new_text = f"{callback.message.text}\n\n{decision_emoji} <b>Решение: СПАМ (ошибка бана)</b>"
+    else:
+        # Обычная обработка для других случаев
+        decision_emoji = "❌" if is_spam else "✅"
+        new_text = f"{callback.message.text}\n\n{decision_emoji} <b>Решение: {decision}</b>"
     
     await callback.message.edit_text(new_text, parse_mode='HTML')
     
