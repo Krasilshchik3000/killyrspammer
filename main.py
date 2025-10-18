@@ -530,32 +530,34 @@ async def is_channel_or_channel_author(message: types.Message) -> bool:
         logger.error(f"❌ Ошибка проверки канала: {e}")
         return False
 
-async def has_user_recent_activity(user_id: int, chat_id: int, minutes: int = 10) -> bool:
-    """Проверить, есть ли у пользователя активность в чате за последние N минут"""
+async def has_user_old_activity(user_id: int, chat_id: int, minutes: int = 10) -> bool:
+    """Проверить, есть ли у пользователя активность в чате БОЛЬШЕ N минут назад"""
     try:
         from database import execute_query, DATABASE_URL
         
-        # Ищем сообщения пользователя в этом чате за последние N минут
+        # Ищем ЛЮБОЕ сообщение пользователя в этом чате СТАРШЕ N минут (быстрый запрос)
         if DATABASE_URL:
-            # PostgreSQL
+            # PostgreSQL - используем LIMIT 1 для скорости
             result = execute_query('''
-                SELECT COUNT(*) FROM messages 
+                SELECT 1 FROM messages 
                 WHERE user_id = %s AND chat_id = %s 
-                AND created_at > NOW() - INTERVAL '%s minutes'
+                AND created_at < NOW() - INTERVAL '%s minutes'
+                LIMIT 1
             ''' % (user_id, chat_id, minutes), fetch='one')
         else:
-            # SQLite
+            # SQLite - используем LIMIT 1 для скорости
             result = execute_query('''
-                SELECT COUNT(*) FROM messages 
+                SELECT 1 FROM messages 
                 WHERE user_id = ? AND chat_id = ? 
-                AND created_at > datetime('now', '-{} minutes')
+                AND created_at < datetime('now', '-{} minutes')
+                LIMIT 1
             '''.format(minutes), (user_id, chat_id), fetch='one')
         
-        if result and result[0] > 0:
-            logger.info(f"✅ Пользователь {user_id} имел активность в чате {chat_id} за последние {minutes} минут")
+        if result:
+            logger.info(f"✅ Пользователь {user_id} имел активность в чате {chat_id} БОЛЬШЕ {minutes} минут назад - НЕ СПАМЕР")
             return True
             
-        logger.info(f"❌ Пользователь {user_id} НЕ имел активности в чате {chat_id} за последние {minutes} минут")
+        logger.info(f"❌ Пользователь {user_id} НЕ имел активности в чате {chat_id} больше {minutes} минут назад - ВОЗМОЖНО СПАМЕР")
         return False
         
     except Exception as e:
@@ -595,9 +597,9 @@ async def ban_spammer_and_delete(message: types.Message, spam_result: SpamResult
             await send_suspicious_message_to_admin(message, spam_result)
             return False
         
-        # 2. Проверяем качество пользователя - если писал раньше 10 минут назад, не баним
-        if await has_user_recent_activity(user_id, chat_id, 10):
-            logger.info(f"🚫 Пропускаем бан пользователя {user_id} - имел активность в чате")
+        # 2. Проверяем качество пользователя - если писал БОЛЬШЕ 10 минут назад, не баним
+        if await has_user_old_activity(user_id, chat_id, 10):
+            logger.info(f"🚫 Пропускаем бан пользователя {user_id} - имел давнюю активность в чате")
             await send_suspicious_message_to_admin(message, spam_result)
             return False
         

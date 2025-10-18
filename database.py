@@ -59,6 +59,12 @@ def init_database():
             )
         ''')
         
+        # Создаем индекс для быстрой проверки активности пользователей
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_messages_user_chat_time 
+            ON messages (user_id, chat_id, created_at)
+        ''')
+        
         # Таблица обучающих примеров
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS training_examples (
@@ -149,6 +155,12 @@ def init_database():
                 admin_decision TEXT,
                 admin_decided_at TIMESTAMP
             )
+        ''')
+        
+        # Создаем индекс для быстрой проверки активности пользователей
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_messages_user_chat_time 
+            ON messages (user_id, chat_id, created_at)
         ''')
         
         # Таблица обучающих примеров
