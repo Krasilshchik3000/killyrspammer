@@ -199,7 +199,12 @@ def init_database():
                 )
                 logger.info("Мигрирован промпт из current_prompt в prompt_versions")
     except Exception:
-        pass  # Таблицы current_prompt нет — это нормально
+        conn.rollback()  # PostgreSQL требует rollback после ошибки в транзакции
+        # Пересоздаём схему после rollback
+        for statement in schema.strip().split(';'):
+            statement = statement.strip()
+            if statement:
+                cursor.execute(statement)
 
     # Если prompt_versions пуст, вставляем дефолтный промпт
     cursor.execute("SELECT COUNT(*) FROM prompt_versions")
