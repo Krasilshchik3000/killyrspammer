@@ -1,296 +1,419 @@
 """
-Модуль для работы с базой данных (SQLite или PostgreSQL)
+Модуль для работы с базой данных (SQLite или PostgreSQL).
+Единая точка доступа — все запросы идут через execute_query().
 """
 import sqlite3
-import os
 from datetime import datetime
 from config import DATABASE_URL, DATABASE_PATH
 import logging
 
 logger = logging.getLogger(__name__)
 
+# ──────────────────────────────────────────────
+# Подключение
+# ──────────────────────────────────────────────
+
 def get_db_connection():
-    """Получить подключение к базе данных"""
     if DATABASE_URL:
-        # PostgreSQL для Railway
-        try:
-            import psycopg2
-            conn = psycopg2.connect(DATABASE_URL)
-            logger.info("✅ Подключение к PostgreSQL установлено")
-            return conn
-        except Exception as e:
-            logger.error(f"❌ Ошибка подключения к PostgreSQL: {e}")
-            raise
+        import psycopg2
+        return psycopg2.connect(DATABASE_URL)
     else:
-        # SQLite для локальной разработки
-        conn = sqlite3.connect(DATABASE_PATH)
-        logger.info("✅ Подключение к SQLite установлено")
-        return conn
+        return sqlite3.connect(DATABASE_PATH)
 
-def init_database():
-    """Инициализация базы данных"""
-    logger.info("🔄 Инициализация БД - удаляю старые таблицы промптов")
-    
-    if DATABASE_URL:
-        # PostgreSQL
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # УДАЛЯЕМ старую таблицу промптов если существует
-        try:
-            cursor.execute("DROP TABLE IF EXISTS prompts")
-            logger.info("🗑️ Удалена старая таблица prompts")
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось удалить старую таблицу: {e}")
-        
-        # Таблица сообщений
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS messages (
-                id BIGSERIAL PRIMARY KEY,
-                message_id BIGINT,
-                chat_id BIGINT,
-                user_id BIGINT,
-                username TEXT,
-                text TEXT,
-                created_at TIMESTAMP,
-                llm_result TEXT,
-                admin_decision TEXT,
-                admin_decided_at TIMESTAMP
-            )
-        ''')
-        
-        # Создаем индекс для быстрой проверки активности пользователей
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_messages_user_chat_time 
-            ON messages (user_id, chat_id, created_at)
-        ''')
-        
-        # Таблица обучающих примеров
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS training_examples (
-                id SERIAL PRIMARY KEY,
-                text TEXT,
-                is_spam BOOLEAN,
-                source TEXT,
-                created_at TIMESTAMP
-            )
-        ''')
-        
-        # Таблица промпта (только один активный)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS current_prompt (
-                id SERIAL PRIMARY KEY,
-                prompt_text TEXT,
-                updated_at TIMESTAMP,
-                improvement_reason TEXT
-            )
-        ''')
-        
-        # Таблица состояний бота
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS bot_state (
-                id SERIAL PRIMARY KEY,
-                admin_id BIGINT,
-                awaiting_prompt_edit BOOLEAN DEFAULT FALSE,
-                pending_prompt TEXT,
-                updated_at TIMESTAMP
-            )
-        ''')
-        
-        # ВРЕМЕННО: Создаем рабочий промпт для стабильности
-        cursor.execute("SELECT COUNT(*) FROM current_prompt")
-        if cursor.fetchone()[0] == 0:
-            # Используем ТВОЙ актуальный промпт как базовый
-            working_prompt = """Проанализируй сообщение из телеграм-группы и ответь строго одним из трёх вариантов:
-СПАМ
-НЕ_СПАМ  
-ВОЗМОЖНО_СПАМ
-
-Считай сообщение спамом, если выполняется хотя бы одно из перечисленных условий:
-
-1. Безадресные (не обращенные к конкретному человеку в чате) предложения заработать денег, а также предложения совершать разные финансовые операции: крипта, инвестиции, обмен. Особенно подозрительно, когда указаны суммы в рублях.
-2. Сообщения, содержащие эмодзи 💘/💝/👄 и подобные им.
-3. В сообщении много эмодзи, которые используются не для эмоций, а, например, для структурирования информации
-
-Если сообщение по этим критериям не подходит под спам, но у тебя есть серьезные причины думать, что это спам — выбирай ВОЗМОЖНО_СПАМ.
-
-Исключения и уточнения:
-
-- Не считай спамом аббревиатуры и названия политических партий, даже если они встречаются в подозрительном контексте.
-- Если сообщение содержит ссылку, но она ведет на официальный ресурс без признаков мошенничества (например, на сайт государственной службы), считай его НЕ_СПАМ.
-- Если сообщение короткое и не содержит явных признаков спама, считай его НЕ_СПАМ, даже если данных для анализа мало.
-- Если сообщение (и это исходит из его смысла) является ответом на другое сообщение в чате, это НЕ_СПАМ.
-
-Сообщение: «{message_text}»
-
-Ответ:"""
-            cursor.execute('''
-                INSERT INTO current_prompt (prompt_text, updated_at, improvement_reason)
-                VALUES (%s, %s, 'ТВОЙ актуальный промпт')
-            ''', (working_prompt, datetime.now()))
-        
-    else:
-        # SQLite (старый код)
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        
-        # УДАЛЯЕМ старую таблицу промптов если существует
-        try:
-            cursor.execute("DROP TABLE IF EXISTS prompts")
-            logger.info("🗑️ Удалена старая таблица prompts из SQLite")
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось удалить старую таблицу из SQLite: {e}")
-        
-        # Таблица сообщений
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER,
-                chat_id INTEGER,
-                user_id INTEGER,
-                username TEXT,
-                text TEXT,
-                created_at TIMESTAMP,
-                llm_result TEXT,
-                admin_decision TEXT,
-                admin_decided_at TIMESTAMP
-            )
-        ''')
-        
-        # Создаем индекс для быстрой проверки активности пользователей
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_messages_user_chat_time 
-            ON messages (user_id, chat_id, created_at)
-        ''')
-        
-        # Таблица обучающих примеров
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS training_examples (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT,
-                is_spam BOOLEAN,
-                source TEXT,
-                created_at TIMESTAMP
-            )
-        ''')
-        
-        # Таблица промпта (только один активный)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS current_prompt (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt_text TEXT,
-                updated_at TIMESTAMP,
-                improvement_reason TEXT
-            )
-        ''')
-        
-        # Таблица состояний бота
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS bot_state (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_id INTEGER,
-                awaiting_prompt_edit BOOLEAN DEFAULT FALSE,
-                pending_prompt TEXT,
-                updated_at TIMESTAMP
-            )
-        ''')
-        
-        # ВРЕМЕННО: Создаем рабочий промпт для стабильности
-        cursor.execute("SELECT COUNT(*) FROM current_prompt")
-        if cursor.fetchone()[0] == 0:
-            # Используем ТВОЙ актуальный промпт как базовый
-            working_prompt = """Проанализируй сообщение из телеграм-группы и ответь строго одним из трёх вариантов:
-СПАМ
-НЕ_СПАМ  
-ВОЗМОЖНО_СПАМ
-
-Считай сообщение спамом, если выполняется хотя бы одно из перечисленных условий:
-
-1. Безадресные (не обращенные к конкретному человеку в чате) предложения заработать денег, а также предложения совершать разные финансовые операции: крипта, инвестиции, обмен. Особенно подозрительно, когда указаны суммы в рублях.
-2. Сообщения, содержащие эмодзи 💘/💝/👄 и подобные им.
-3. В сообщении много эмодзи, которые используются не для эмоций, а, например, для структурирования информации
-
-Если сообщение по этим критериям не подходит под спам, но у тебя есть серьезные причины думать, что это спам — выбирай ВОЗМОЖНО_СПАМ.
-
-Исключения и уточнения:
-
-- Не считай спамом аббревиатуры и названия политических партий, даже если они встречаются в подозрительном контексте.
-- Если сообщение содержит ссылку, но она ведет на официальный ресурс без признаков мошенничества (например, на сайт государственной службы), считай его НЕ_СПАМ.
-- Если сообщение короткое и не содержит явных признаков спама, считай его НЕ_СПАМ, даже если данных для анализа мало.
-- Если сообщение (и это исходит из его смысла) является ответом на другое сообщение в чате, это НЕ_СПАМ.
-
-Сообщение: «{message_text}»
-
-Ответ:"""
-            cursor.execute('''
-                INSERT INTO current_prompt (prompt_text, updated_at, improvement_reason)
-                VALUES (?, ?, 'ТВОЙ актуальный промпт')
-            ''', (working_prompt, datetime.now()))
-    
-    conn.commit()
-    conn.close()
-    logger.info("✅ База данных инициализирована")
 
 def execute_query(query, params=None, fetch=False):
-    """Универсальное выполнение запроса"""
+    """Универсальное выполнение запроса.
+
+    fetch = False  — ничего не возвращает (INSERT/UPDATE/DELETE)
+    fetch = 'one'  — fetchone()
+    fetch = 'all'  — fetchall()
+    """
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
-        
+
         if DATABASE_URL:
-            # PostgreSQL - заменяем ? на %s
             query = query.replace('?', '%s')
-        
+
         if params:
             cursor.execute(query, params)
         else:
             cursor.execute(query)
-        
+
         result = None
         if fetch == 'one':
             result = cursor.fetchone()
         elif fetch == 'all':
             result = cursor.fetchall()
-        
+
         conn.commit()
-        conn.close()
-        
         return result
-        
+
     except Exception as e:
-        logger.error(f"❌ Ошибка выполнения запроса: {e}")
-        logger.error(f"📝 Запрос: {query}")
-        logger.error(f"📝 Параметры: {params}")
+        logger.error(f"DB error: {e} | query: {query} | params: {params}")
+        conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+# ──────────────────────────────────────────────
+# Инициализация схемы
+# ──────────────────────────────────────────────
+
+_SCHEMA_SQLITE = """
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER,
+    chat_id INTEGER,
+    user_id INTEGER,
+    username TEXT,
+    text TEXT,
+    created_at TIMESTAMP,
+    llm_result TEXT,
+    admin_decision TEXT,
+    admin_decided_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_user_chat_time
+    ON messages (user_id, chat_id, created_at);
+
+CREATE TABLE IF NOT EXISTS training_examples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT,
+    is_spam BOOLEAN,
+    source TEXT,
+    created_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS prompt_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prompt_text TEXT NOT NULL,
+    reason TEXT,
+    created_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS bot_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id INTEGER,
+    awaiting_prompt_edit BOOLEAN DEFAULT FALSE,
+    pending_prompt TEXT,
+    updated_at TIMESTAMP
+);
+"""
+
+_SCHEMA_POSTGRES = """
+CREATE TABLE IF NOT EXISTS messages (
+    id BIGSERIAL PRIMARY KEY,
+    message_id BIGINT,
+    chat_id BIGINT,
+    user_id BIGINT,
+    username TEXT,
+    text TEXT,
+    created_at TIMESTAMP,
+    llm_result TEXT,
+    admin_decision TEXT,
+    admin_decided_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_user_chat_time
+    ON messages (user_id, chat_id, created_at);
+
+CREATE TABLE IF NOT EXISTS training_examples (
+    id SERIAL PRIMARY KEY,
+    text TEXT,
+    is_spam BOOLEAN,
+    source TEXT,
+    created_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS prompt_versions (
+    id SERIAL PRIMARY KEY,
+    prompt_text TEXT NOT NULL,
+    reason TEXT,
+    created_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS bot_state (
+    id SERIAL PRIMARY KEY,
+    admin_id BIGINT,
+    awaiting_prompt_edit BOOLEAN DEFAULT FALSE,
+    pending_prompt TEXT,
+    updated_at TIMESTAMP
+);
+"""
+
+DEFAULT_PROMPT = """Проанализируй сообщение из телеграм-группы и ответь строго одним из трёх вариантов:
+СПАМ
+НЕ_СПАМ
+ВОЗМОЖНО_СПАМ
+
+Считай сообщение спамом, если выполняется хотя бы одно из перечисленных условий:
+
+1. Безадресные (не обращенные к конкретному человеку в чате) предложения заработать денег, а также предложения совершать разные финансовые операции: крипта, инвестиции, обмен. Особенно подозрительно, когда указаны суммы в рублях.
+2. Сообщения, содержащие эмодзи 💘/💝/👄 и подобные им.
+3. В сообщении много эмодзи, которые используются не для эмоций, а, например, для структурирования информации
+
+Если сообщение по этим критериям не подходит под спам, но у тебя есть серьезные причины думать, что это спам — выбирай ВОЗМОЖНО_СПАМ.
+
+Исключения и уточнения:
+
+- Не считай спамом аббревиатуры и названия политических партий, даже если они встречаются в подозрительном контексте.
+- Если сообщение содержит ссылку, но она ведет на официальный ресурс без признаков мошенничества (например, на сайт государственной службы), считай его НЕ_СПАМ.
+- Если сообщение короткое и не содержит явных признаков спама, считай его НЕ_СПАМ, даже если данных для анализа мало.
+- Если сообщение (и это исходит из его смысла) является ответом на другое сообщение в чате, это НЕ_СПАМ.
+
+{few_shot_block}Сообщение: «{message_text}»
+
+Ответ:"""
+
+
+def init_database():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    schema = _SCHEMA_POSTGRES if DATABASE_URL else _SCHEMA_SQLITE
+    for statement in schema.strip().split(';'):
+        statement = statement.strip()
+        if statement:
+            cursor.execute(statement)
+
+    # Мигрируем: если есть старая таблица current_prompt, переносим последний промпт
+    try:
+        cursor.execute("SELECT prompt_text, improvement_reason FROM current_prompt ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+        if row:
+            prompt_text, reason = row
+            cursor.execute("SELECT COUNT(*) FROM prompt_versions")
+            if cursor.fetchone()[0] == 0:
+                placeholder = '%s' if DATABASE_URL else '?'
+                cursor.execute(
+                    f"INSERT INTO prompt_versions (prompt_text, reason, created_at) VALUES ({placeholder}, {placeholder}, {placeholder})",
+                    (prompt_text, reason or 'Миграция из current_prompt', datetime.now())
+                )
+                logger.info("Мигрирован промпт из current_prompt в prompt_versions")
+    except Exception:
+        pass  # Таблицы current_prompt нет — это нормально
+
+    # Если prompt_versions пуст, вставляем дефолтный промпт
+    cursor.execute("SELECT COUNT(*) FROM prompt_versions")
+    if cursor.fetchone()[0] == 0:
+        placeholder = '%s' if DATABASE_URL else '?'
+        cursor.execute(
+            f"INSERT INTO prompt_versions (prompt_text, reason, created_at) VALUES ({placeholder}, {placeholder}, {placeholder})",
+            (DEFAULT_PROMPT, 'Начальный промпт', datetime.now())
+        )
+
+    conn.commit()
+    conn.close()
+    logger.info("БД инициализирована")
+
+
+# ──────────────────────────────────────────────
+# Промпты — версионирование
+# ──────────────────────────────────────────────
+
+def get_current_prompt() -> str:
+    row = execute_query(
+        "SELECT prompt_text FROM prompt_versions ORDER BY id DESC LIMIT 1",
+        fetch='one'
+    )
+    return row[0] if row else DEFAULT_PROMPT
+
+
+def save_prompt_version(prompt_text: str, reason: str):
+    execute_query(
+        "INSERT INTO prompt_versions (prompt_text, reason, created_at) VALUES (?, ?, ?)",
+        (prompt_text, reason, datetime.now())
+    )
+    logger.info(f"Сохранена новая версия промпта: {reason}")
+
+
+def get_prompt_history(limit=10):
+    return execute_query(
+        "SELECT id, reason, created_at FROM prompt_versions ORDER BY id DESC LIMIT ?",
+        (limit,), fetch='all'
+    ) or []
+
+
+def rollback_prompt(version_id: int) -> bool:
+    row = execute_query(
+        "SELECT prompt_text, reason FROM prompt_versions WHERE id = ?",
+        (version_id,), fetch='one'
+    )
+    if not row:
+        return False
+    save_prompt_version(row[0], f"Откат к версии #{version_id} ({row[1]})")
+    return True
+
+
+# ──────────────────────────────────────────────
+# Training examples
+# ──────────────────────────────────────────────
+
+def add_training_example(text: str, is_spam: bool, source: str):
+    execute_query(
+        "INSERT INTO training_examples (text, is_spam, source, created_at) VALUES (?, ?, ?, ?)",
+        (text, is_spam, source, datetime.now())
+    )
+
+
+def get_few_shot_examples(limit=10):
+    """Получить последние обучающие примеры для few-shot контекста."""
+    rows = execute_query(
+        "SELECT text, is_spam FROM training_examples ORDER BY id DESC LIMIT ?",
+        (limit,), fetch='all'
+    )
+    return rows or []
+
+
+def get_validation_examples(limit=30):
+    """Получить примеры для валидации промпта (и спам, и не спам)."""
+    # Берём поровну спам и не спам для сбалансированной оценки
+    half = limit // 2
+    spam = execute_query(
+        "SELECT text, is_spam FROM training_examples WHERE is_spam = 1 ORDER BY id DESC LIMIT ?",
+        (half,), fetch='all'
+    ) or []
+    not_spam = execute_query(
+        "SELECT text, is_spam FROM training_examples WHERE is_spam = 0 ORDER BY id DESC LIMIT ?",
+        (half,), fetch='all'
+    ) or []
+    return spam + not_spam
+
+
+def count_errors_since_last_improvement() -> int:
+    """Сколько ошибок бота накопилось с последнего улучшения промпта."""
+    # Находим время последнего улучшения
+    last_improvement = execute_query(
+        "SELECT created_at FROM prompt_versions ORDER BY id DESC LIMIT 1",
+        fetch='one'
+    )
+    if not last_improvement or not last_improvement[0]:
+        # Нет промптов — считаем все ошибки
+        row = execute_query(
+            "SELECT COUNT(*) FROM messages WHERE admin_decision IS NOT NULL "
+            "AND ((llm_result = 'НЕ_СПАМ' AND admin_decision = 'СПАМ') "
+            "  OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'НЕ_СПАМ'))",
+            fetch='one'
+        )
+        return row[0] if row else 0
+
+    row = execute_query(
+        "SELECT COUNT(*) FROM messages WHERE admin_decision IS NOT NULL "
+        "AND admin_decided_at > ? "
+        "AND ((llm_result = 'НЕ_СПАМ' AND admin_decision = 'СПАМ') "
+        "  OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'НЕ_СПАМ'))",
+        (last_improvement[0],), fetch='one'
+    )
+    return row[0] if row else 0
+
+
+def count_training_examples() -> int:
+    row = execute_query("SELECT COUNT(*) FROM training_examples", fetch='one')
+    return row[0] if row else 0
+
+
+# ──────────────────────────────────────────────
+# Сообщения
+# ──────────────────────────────────────────────
+
+def save_message(message_id, chat_id, user_id, username, text, llm_result=None):
+    execute_query(
+        """INSERT INTO messages (message_id, chat_id, user_id, username, text, created_at, llm_result)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (message_id, chat_id, user_id, username, text, datetime.now(), llm_result)
+    )
+
+
+def update_admin_decision(message_id: int, decision: str):
+    execute_query(
+        "UPDATE messages SET admin_decision = ?, admin_decided_at = ? WHERE message_id = ?",
+        (decision, datetime.now(), message_id)
+    )
+
+
+def get_message_by_id(message_id: int):
+    return execute_query(
+        "SELECT text, llm_result, user_id, chat_id FROM messages WHERE message_id = ?",
+        (message_id,), fetch='one'
+    )
+
+
+def get_user_messages(user_id: int, limit=100):
+    """Получить все message_id и chat_id сообщений пользователя (для удаления)."""
+    return execute_query(
+        "SELECT message_id, chat_id FROM messages WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+        (user_id, limit), fetch='all'
+    ) or []
+
+
+def get_recent_mistakes(limit=10):
+    return execute_query(
+        """SELECT text, llm_result, admin_decision, created_at
+           FROM messages
+           WHERE admin_decision IS NOT NULL
+             AND ((llm_result = 'НЕ_СПАМ' AND admin_decision = 'СПАМ')
+                  OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'НЕ_СПАМ'))
+           ORDER BY admin_decided_at DESC LIMIT ?""",
+        (limit,), fetch='all'
+    ) or []
+
+
+def count_user_messages(user_id: int, chat_id: int) -> int:
+    """Сколько сообщений пользователь написал в данном чате."""
+    row = execute_query(
+        "SELECT COUNT(*) FROM messages WHERE user_id = ? AND chat_id = ?",
+        (user_id, chat_id), fetch='one'
+    )
+    return row[0] if row else 0
+
+
+def has_user_old_activity(user_id: int, chat_id: int, minutes: int = 10) -> bool:
+    """Есть ли у пользователя сообщения старше N минут в этом чате."""
+    if DATABASE_URL:
+        # PostgreSQL — параметризованный запрос
+        row = execute_query(
+            "SELECT 1 FROM messages WHERE user_id = ? AND chat_id = ? "
+            "AND created_at < NOW() - INTERVAL '1 minute' * ? LIMIT 1",
+            (user_id, chat_id, minutes), fetch='one'
+        )
+    else:
+        # SQLite — minutes нельзя параметризовать в datetime(), но можно безопасно
+        row = execute_query(
+            "SELECT 1 FROM messages WHERE user_id = ? AND chat_id = ? "
+            f"AND created_at < datetime('now', '-{int(minutes)} minutes') LIMIT 1",
+            (user_id, chat_id), fetch='one'
+        )
+    return row is not None
+
+
+def get_stats():
+    total = execute_query("SELECT COUNT(*) FROM messages", fetch='one')[0]
+    spam = execute_query("SELECT COUNT(*) FROM messages WHERE llm_result = 'СПАМ'", fetch='one')[0]
+    maybe = execute_query("SELECT COUNT(*) FROM messages WHERE llm_result = 'ВОЗМОЖНО_СПАМ'", fetch='one')[0]
+    reviewed = execute_query("SELECT COUNT(*) FROM messages WHERE admin_decision IS NOT NULL", fetch='one')[0]
+    training = execute_query("SELECT COUNT(*) FROM training_examples", fetch='one')[0]
+    return total, spam, maybe, reviewed, training
+
+
+# ──────────────────────────────────────────────
+# Состояние бота (для режима редактирования промпта)
+# ──────────────────────────────────────────────
 
 def set_bot_state(admin_id, awaiting_prompt_edit=False, pending_prompt=None):
-    """Сохранить состояние бота"""
-    try:
-        # Удаляем старое состояние для этого админа
-        execute_query("DELETE FROM bot_state WHERE admin_id = ?", (admin_id,))
-        
-        # Добавляем новое состояние
-        execute_query('''
-            INSERT INTO bot_state (admin_id, awaiting_prompt_edit, pending_prompt, updated_at)
-            VALUES (?, ?, ?, ?)
-        ''', (admin_id, awaiting_prompt_edit, pending_prompt, datetime.now()))
-        
-        logger.info(f"💾 Состояние бота сохранено: awaiting_prompt_edit={awaiting_prompt_edit}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка сохранения состояния: {e}")
+    execute_query("DELETE FROM bot_state WHERE admin_id = ?", (admin_id,))
+    execute_query(
+        "INSERT INTO bot_state (admin_id, awaiting_prompt_edit, pending_prompt, updated_at) VALUES (?, ?, ?, ?)",
+        (admin_id, awaiting_prompt_edit, pending_prompt, datetime.now())
+    )
+
 
 def get_bot_state(admin_id):
-    """Получить состояние бота"""
-    try:
-        result = execute_query(
-            "SELECT awaiting_prompt_edit, pending_prompt FROM bot_state WHERE admin_id = ? ORDER BY updated_at DESC LIMIT 1",
-            (admin_id,), fetch='one'
-        )
-        if result:
-            awaiting_edit, pending = result
-            logger.info(f"📖 Загружено состояние: awaiting_prompt_edit={awaiting_edit}")
-            return awaiting_edit, pending
-        return False, None
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения состояния: {e}")
-        return False, None
+    row = execute_query(
+        "SELECT awaiting_prompt_edit, pending_prompt FROM bot_state WHERE admin_id = ? ORDER BY updated_at DESC LIMIT 1",
+        (admin_id,), fetch='one'
+    )
+    if row:
+        return row[0], row[1]
+    return False, None

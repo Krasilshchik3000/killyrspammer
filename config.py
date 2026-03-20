@@ -4,7 +4,6 @@
 import os
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения
 load_dotenv()
 
 # Токен Telegram бота
@@ -15,30 +14,48 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # ID администратора
 ADMIN_ID = int(os.getenv("ADMIN_ID") or "0")
-
-# Проверяем что ADMIN_ID установлен корректно
 if ADMIN_ID <= 0:
     import logging
-    logging.warning("⚠️ ADMIN_ID не установлен или некорректен! Бот будет работать без функций администратора.")
-    ADMIN_ID = -1  # Специальное значение для отключенного админа
+    logging.warning("⚠️ ADMIN_ID не установлен или некорректен!")
+    ADMIN_ID = -1
 
-# Белый список групп (только эти группы будут обрабатываться)
+# Белый список групп
 ALLOWED_GROUP_IDS = [
-    -1002116322225,  # Группа 1
-    -4952972324,     # спамтестгруппа (из логов)
-    -1001508463207,  # Группа 3
-    -1001342298943   # Группа 4
+    -1002116322225,
+    -4952972324,
+    -1001508463207,
+    -1001342298943,
 ]
 
 # Настройки базы данных
-DATABASE_URL = os.getenv("DATABASE_URL")  # Для Railway PostgreSQL
-DATABASE_PATH = os.getenv("DATABASE_PATH", "antispam.db")  # Локальная SQLite
+DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL (Railway)
+DATABASE_PATH = os.getenv("DATABASE_PATH", "antispam.db")  # SQLite (локальная)
 
 # Настройки LLM
-LLM_MODEL = "gpt-3.5-turbo"
-LLM_MAX_TOKENS = 5
+# gpt-5.4-nano: самая быстрая/дешёвая модель ($0.20/1M input), заточена под классификацию
+# gpt-5.4-mini: для анализа ошибок и улучшения промптов (мощнее, но всё ещё дешёвая)
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4-nano")
+LLM_IMPROVEMENT_MODEL = os.getenv("LLM_IMPROVEMENT_MODEL", "gpt-5.4-mini")
+LLM_MAX_TOKENS = 10
 LLM_TEMPERATURE = 0
 LLM_TIMEOUT = 10
+
+# Rate limiting
+MAX_REQUESTS_PER_MINUTE = 5
+
+# Few-shot: сколько примеров из training_examples подставлять в контекст
+FEW_SHOT_EXAMPLES_COUNT = 10
+
+# Combot Anti-Spam (CAS) — бесплатная база спамеров
+CAS_API_URL = "https://api.cas.chat/check"
+
+# Автоматическое улучшение промпта
+# После скольких ошибок запускать улучшение промпта
+AUTO_IMPROVE_AFTER_ERRORS = int(os.getenv("AUTO_IMPROVE_AFTER_ERRORS", "3"))
+# Минимум примеров для валидации нового промпта
+MIN_VALIDATION_EXAMPLES = int(os.getenv("MIN_VALIDATION_EXAMPLES", "5"))
+# Максимум примеров для валидации (больше = точнее, но дороже)
+MAX_VALIDATION_EXAMPLES = int(os.getenv("MAX_VALIDATION_EXAMPLES", "30"))
 
 # Логирование
 LOG_LEVEL = "INFO"
