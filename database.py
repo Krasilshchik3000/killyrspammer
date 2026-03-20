@@ -298,11 +298,11 @@ def get_validation_examples(limit=30):
     # Берём поровну спам и не спам для сбалансированной оценки
     half = limit // 2
     spam = execute_query(
-        "SELECT text, is_spam FROM training_examples WHERE is_spam = 1 ORDER BY id DESC LIMIT ?",
+        "SELECT text, is_spam FROM training_examples WHERE is_spam = TRUE ORDER BY id DESC LIMIT ?",
         (half,), fetch='all'
     ) or []
     not_spam = execute_query(
-        "SELECT text, is_spam FROM training_examples WHERE is_spam = 0 ORDER BY id DESC LIMIT ?",
+        "SELECT text, is_spam FROM training_examples WHERE is_spam = FALSE ORDER BY id DESC LIMIT ?",
         (half,), fetch='all'
     ) or []
     return spam + not_spam
