@@ -32,10 +32,11 @@ DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL (Railway)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "antispam.db")  # SQLite (локальная)
 
 # Настройки LLM
-# gpt-5.4-nano: самая быстрая/дешёвая модель ($0.20/1M input), заточена под классификацию
-# gpt-5.4-mini: для анализа ошибок и улучшения промптов (мощнее, но всё ещё дешёвая)
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4-nano")
-LLM_IMPROVEMENT_MODEL = os.getenv("LLM_IMPROVEMENT_MODEL", "gpt-5.4-mini")
+# gpt-4o-mini: проверенная быстрая/дешёвая модель для классификации
+# gpt-4o: для анализа ошибок и улучшения промптов (мощнее)
+# Можно переключить на gpt-5.4-nano/mini через env vars когда они стабилизируются
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+LLM_IMPROVEMENT_MODEL = os.getenv("LLM_IMPROVEMENT_MODEL", "gpt-4o")
 LLM_MAX_TOKENS = 30
 LLM_TEMPERATURE = 0
 LLM_TIMEOUT = 10
