@@ -717,10 +717,13 @@ async def handle_message(message: types.Message):
         return
 
     uid, cid = message.from_user.id, message.chat.id
+    username = message.from_user.username or message.from_user.full_name
+    text_preview = (message.text or '')[:80].replace('\n', ' ')
     user_msg_count = db.count_user_messages(uid, cid)
 
     # Пользователь с историей сообщений — доверенный, не проверяем через LLM
     if user_msg_count >= TRUSTED_USER_MESSAGES:
+        logger.info(f"✅ TRUSTED @{username} (msgs={user_msg_count}) | {message.chat.title} | «{text_preview}»")
         try:
             db.save_message(message.message_id, cid, uid, message.from_user.username or '', message.text, "НЕ_СПАМ")
         except Exception:
@@ -731,6 +734,7 @@ async def handle_message(message: types.Message):
 
     # CAS + нет истории → автобан
     if is_cas_banned and user_msg_count == 0:
+        logger.info(f"🚫 CAS-BAN @{username} (cas=True, msgs=0) | {message.chat.title} | «{text_preview}»")
         try:
             db.save_message(message.message_id, cid, uid, message.from_user.username or '', message.text, "СПАМ")
         except Exception:
@@ -739,6 +743,8 @@ async def handle_message(message: types.Message):
         return
 
     result = await check_message_with_llm(message.text, uid, user_msg_count, is_cas_banned)
+    emoji = {"СПАМ": "🔴", "ВОЗМОЖНО_СПАМ": "🟡", "НЕ_СПАМ": "🟢"}[result.value]
+    logger.info(f"{emoji} LLM→{result.value} @{username} (msgs={user_msg_count}, cas={is_cas_banned}) | {message.chat.title} | «{text_preview}»")
 
     try:
         db.save_message(message.message_id, cid, uid, message.from_user.username or '', message.text, result.value)
