@@ -32,11 +32,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL (Railway)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "antispam.db")  # SQLite (локальная)
 
 # Настройки LLM
-# gpt-4.1-nano: самая дешёвая ($0.10/1M), отлично классифицирует спам на русском
-# gpt-4.1-mini: для улучшения промптов (мощнее, но быстрая)
-# НЕ использовать gpt-5+: требуют max_completion_tokens вместо max_tokens
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-nano")
-LLM_IMPROVEMENT_MODEL = os.getenv("LLM_IMPROVEMENT_MODEL", "gpt-4.1-mini")
+# gpt-5.4-nano: самая дешёвая ($0.20/1M), отлично классифицирует спам
+# gpt-5.4-mini: для улучшения промптов (мощнее, $0.75/1M)
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4-nano")
+LLM_IMPROVEMENT_MODEL = os.getenv("LLM_IMPROVEMENT_MODEL", "gpt-5.4-mini")
 LLM_MAX_TOKENS = 30
 LLM_TEMPERATURE = 0
 LLM_TIMEOUT = 10

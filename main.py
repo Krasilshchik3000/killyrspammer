@@ -45,6 +45,19 @@ _http_client: httpx.AsyncClient = None
 _improvement_in_progress = False
 
 
+def _token_limit_param(max_tokens: int) -> dict:
+    """gpt-5+ требуют max_completion_tokens вместо max_tokens."""
+    if LLM_MODEL.startswith(("gpt-5", "o1", "o3", "o4")):
+        return {"max_completion_tokens": max_tokens}
+    return {"max_tokens": max_tokens}
+
+
+def _token_limit_param_improvement(max_tokens: int) -> dict:
+    if LLM_IMPROVEMENT_MODEL.startswith(("gpt-5", "o1", "o3", "o4")):
+        return {"max_completion_tokens": max_tokens}
+    return {"max_tokens": max_tokens}
+
+
 class SpamResult(Enum):
     SPAM = "СПАМ"
     NOT_SPAM = "НЕ_СПАМ"
@@ -173,7 +186,7 @@ async def classify_message(
     response = await openai_client.chat.completions.create(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=LLM_MAX_TOKENS,
+        **_token_limit_param(LLM_MAX_TOKENS),
         temperature=LLM_TEMPERATURE,
         timeout=LLM_TIMEOUT,
     )
@@ -288,7 +301,7 @@ async def generate_improved_prompt(error_type: str, message_text: str) -> tuple[
                 {"role": "system", "content": "Ты помощник по улучшению промптов. Всегда отвечай строго в указанном формате с маркерами АНАЛИЗ: и ИТОГОВЫЙ_ПРОМПТ:"},
                 {"role": "user", "content": analysis_prompt},
             ],
-            max_tokens=3000,
+            **_token_limit_param_improvement(3000),
             temperature=0.3,
             timeout=60,
         )
