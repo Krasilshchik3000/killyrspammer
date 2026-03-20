@@ -49,6 +49,9 @@ FEW_SHOT_EXAMPLES_COUNT = 10
 # Combot Anti-Spam (CAS) — бесплатная база спамеров
 CAS_API_URL = "https://api.cas.chat/check"
 
+# Сколько сообщений в группе нужно, чтобы считать пользователя «своим» и не проверять через LLM
+TRUSTED_USER_MESSAGES = int(os.getenv("TRUSTED_USER_MESSAGES", "3"))
+
 # Автоматическое улучшение промпта
 # После скольких ошибок запускать улучшение промпта
 AUTO_IMPROVE_AFTER_ERRORS = int(os.getenv("AUTO_IMPROVE_AFTER_ERRORS", "3"))

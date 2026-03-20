@@ -27,7 +27,7 @@ from config import (
     BOT_TOKEN, OPENAI_API_KEY, ADMIN_ID, ALLOWED_GROUP_IDS,
     LLM_MODEL, LLM_IMPROVEMENT_MODEL, LLM_MAX_TOKENS,
     LLM_TEMPERATURE, LLM_TIMEOUT, MAX_REQUESTS_PER_MINUTE,
-    FEW_SHOT_EXAMPLES_COUNT, CAS_API_URL,
+    FEW_SHOT_EXAMPLES_COUNT, CAS_API_URL, TRUSTED_USER_MESSAGES,
     AUTO_IMPROVE_AFTER_ERRORS, MIN_VALIDATION_EXAMPLES, MAX_VALIDATION_EXAMPLES,
 )
 import database as db
@@ -718,6 +718,15 @@ async def handle_message(message: types.Message):
 
     uid, cid = message.from_user.id, message.chat.id
     user_msg_count = db.count_user_messages(uid, cid)
+
+    # Пользователь с историей сообщений — доверенный, не проверяем через LLM
+    if user_msg_count >= TRUSTED_USER_MESSAGES:
+        try:
+            db.save_message(message.message_id, cid, uid, message.from_user.username or '', message.text, "НЕ_СПАМ")
+        except Exception:
+            pass
+        return
+
     is_cas_banned = await check_cas_ban(uid)
 
     # CAS + нет истории → автобан
