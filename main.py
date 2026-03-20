@@ -177,7 +177,10 @@ async def classify_message(
         temperature=LLM_TEMPERATURE,
         timeout=LLM_TIMEOUT,
     )
-    return parse_llm_response(response.choices[0].message.content.strip())
+    raw = response.choices[0].message.content.strip()
+    result = parse_llm_response(raw)
+    logger.info(f"LLM raw response: '{raw}' → {result.value}")
+    return result
 
 
 async def check_message_with_llm(
@@ -239,7 +242,7 @@ async def generate_improved_prompt(error_type: str, message_text: str) -> tuple[
     descriptions = {
         "missed_spam": "Бот НЕ определил как спам, хотя это спам",
         "uncertain_spam": "Бот определил как ВОЗМОЖНО_СПАМ, но это точно спам",
-        "false_positive": "Бот определил как спам, хотя это НЕ спам",
+        "false_positive": "Бот определил как спам/ВОЗМОЖНО_СПАМ, хотя это НЕ спам (ложное срабатывание)",
     }
     description = descriptions.get(error_type, error_type)
 
@@ -251,39 +254,68 @@ async def generate_improved_prompt(error_type: str, message_text: str) -> tuple[
             lines.append(f"  - «{text[:80]}» — бот: {bot_dec}, правильно: {admin_dec}")
         mistakes_block = "\n".join(lines)
 
-    analysis_prompt = f"""Ты эксперт по созданию промптов для определения спама в Telegram.
+    analysis_prompt = f"""Ты эксперт по созданию промптов для определения спама в Telegram-группах.
 
-ТЕКУЩИЙ ПРОМПТ:
+ТЕКУЩИЙ ПРОМПТ (используется для классификации сообщений):
+---
 {current_prompt}
+---
 
-ОШИБКА: {description}
-Сообщение: "{message_text}"
+ОШИБКА КЛАССИФИКАЦИИ: {description}
+Проблемное сообщение: "{message_text}"
 
 {mistakes_block}
 
 ЗАДАЧА: Улучши промпт так, чтобы он правильно обрабатывал это и похожие сообщения.
-Сохрани ВСЕ существующие критерии, исключения и структуру. Только дополни/уточни.
-Промпт ОБЯЗАН содержать {{message_text}} и {{few_shot_block}} — это шаблонные переменные.
-Промпт ОБЯЗАН содержать три варианта ответа: СПАМ, НЕ_СПАМ, ВОЗМОЖНО_СПАМ.
 
-Ответь в формате:
-АНАЛИЗ: [причина ошибки в 1-2 предложениях]
-ИТОГОВЫЙ_ПРОМПТ: [полный улучшенный промпт]"""
+ПРАВИЛА:
+1. Сохрани ВСЕ существующие критерии, исключения и структуру. Только дополни/уточни.
+2. Промпт ОБЯЗАН содержать шаблонные переменные: {{{{message_text}}}} и {{{{few_shot_block}}}}
+3. Промпт ОБЯЗАН содержать три варианта ответа: СПАМ, НЕ_СПАМ, ВОЗМОЖНО_СПАМ
+4. Если ошибка — ложное срабатывание, добавь исключение чтобы подобные сообщения НЕ считались спамом.
+
+Ответь СТРОГО в формате (два блока, разделённых маркером):
+
+АНАЛИЗ: причина ошибки в 1-2 предложениях
+
+ИТОГОВЫЙ_ПРОМПТ:
+полный улучшенный промпт здесь"""
 
     try:
         response = await openai_client.chat.completions.create(
             model=LLM_IMPROVEMENT_MODEL,
-            messages=[{"role": "user", "content": analysis_prompt}],
-            max_tokens=2000,
+            messages=[
+                {"role": "system", "content": "Ты помощник по улучшению промптов. Всегда отвечай строго в указанном формате с маркерами АНАЛИЗ: и ИТОГОВЫЙ_ПРОМПТ:"},
+                {"role": "user", "content": analysis_prompt},
+            ],
+            max_tokens=3000,
             temperature=0.3,
-            timeout=30,
+            timeout=60,
         )
         text = response.choices[0].message.content.strip()
+        logger.info(f"LLM improvement response length: {len(text)}, has marker: {'ИТОГОВЫЙ_ПРОМПТ:' in text}")
 
-        if "ИТОГОВЫЙ_ПРОМПТ:" not in text:
+        # Ищем маркер (с возможными вариациями форматирования)
+        marker = None
+        for m in ["ИТОГОВЫЙ_ПРОМПТ:", "ИТОГОВЫЙ ПРОМПТ:", "**ИТОГОВЫЙ_ПРОМПТ:**", "**ИТОГОВЫЙ_ПРОМПТ**:"]:
+            if m in text:
+                marker = m
+                break
+
+        if not marker:
+            logger.warning(f"Маркер ИТОГОВЫЙ_ПРОМПТ не найден в ответе LLM (первые 200 символов): {text[:200]}")
             return text, None
 
-        improved = text.split("ИТОГОВЫЙ_ПРОМПТ:", 1)[1].strip()
+        improved = text.split(marker, 1)[1].strip()
+
+        # Убираем возможные markdown-обёртки
+        if improved.startswith("```"):
+            improved = improved.split("```", 2)[1]
+            if improved.startswith("\n"):
+                improved = improved[1:]
+            if "```" in improved:
+                improved = improved.rsplit("```", 1)[0]
+            improved = improved.strip()
 
         # Патчим если потеряны обязательные элементы
         if "{message_text}" not in improved:
@@ -291,11 +323,17 @@ async def generate_improved_prompt(error_type: str, message_text: str) -> tuple[
         if "{few_shot_block}" not in improved:
             improved = improved.replace("Сообщение: «{message_text}»", "{few_shot_block}\nСообщение: «{message_text}»")
 
-        analysis = text.split("ИТОГОВЫЙ_ПРОМПТ:")[0].strip()
+        analysis = text.split(marker)[0].strip()
+        # Убираем маркер АНАЛИЗ: из начала
+        if analysis.startswith("АНАЛИЗ:"):
+            analysis = analysis[7:].strip()
+        elif analysis.startswith("**АНАЛИЗ:**"):
+            analysis = analysis[11:].strip()
+
         return analysis, improved
 
     except Exception as e:
-        logger.error(f"Ошибка генерации промпта: {e}")
+        logger.error(f"Ошибка генерации промпта: {e}", exc_info=True)
         return None, None
 
 
@@ -320,7 +358,8 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
         # 1. Генерируем улучшенный промпт
         analysis, improved = await generate_improved_prompt(trigger_error_type, trigger_message)
         if not improved:
-            await bot.send_message(ADMIN_ID, f"⚠️ Не удалось сгенерировать улучшенный промпт")
+            detail = f"\nАнализ LLM: {analysis[:300]}" if analysis else "\nLLM не вернул ответ"
+            await bot.send_message(ADMIN_ID, f"⚠️ Не удалось сгенерировать улучшенный промпт (LLM не вернул маркер ИТОГОВЫЙ_ПРОМПТ){detail}")
             return
 
         problems = validate_prompt(improved)
