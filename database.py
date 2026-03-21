@@ -215,18 +215,18 @@ def init_database():
             (DEFAULT_PROMPT, 'Начальный промпт', datetime.now())
         )
 
-    # Проверяем, не устарел ли текущий промпт (содержит старые критерии)
+    # Проверяем, не устарел ли текущий промпт
     cursor.execute("SELECT prompt_text FROM prompt_versions ORDER BY id DESC LIMIT 1")
     current_row = cursor.fetchone()
     if current_row and current_row[0]:
         current_text = current_row[0]
-        # Признак старого промпта: содержит "предложения совершать разные финансовые операции"
-        # и НЕ содержит "Правило по умолчанию"
-        if "предложения совершать разные финансовые операции" in current_text and "Правило по умолчанию" not in current_text:
+        # Признаки нового промпта: содержит "Правило по умолчанию" И "обязательные исключения"
+        has_new_markers = "Правило по умолчанию" in current_text and "обязательные исключения" in current_text
+        if not has_new_markers:
             placeholder = '%s' if DATABASE_URL else '?'
             cursor.execute(
                 f"INSERT INTO prompt_versions (prompt_text, reason, created_at) VALUES ({placeholder}, {placeholder}, {placeholder})",
-                (DEFAULT_PROMPT, 'Обновление: снижение false positives', datetime.now())
+                (DEFAULT_PROMPT, 'Автообновление: улучшенный промпт v2', datetime.now())
             )
             logger.info("Обновлён устаревший промпт на новую версию")
 
@@ -298,12 +298,12 @@ def get_validation_examples(limit=30):
     # Берём поровну спам и не спам для сбалансированной оценки
     half = limit // 2
     spam = execute_query(
-        "SELECT text, is_spam FROM training_examples WHERE is_spam = TRUE ORDER BY id DESC LIMIT ?",
-        (half,), fetch='all'
+        "SELECT text, is_spam FROM training_examples WHERE is_spam = ? ORDER BY id DESC LIMIT ?",
+        (True, half), fetch='all'
     ) or []
     not_spam = execute_query(
-        "SELECT text, is_spam FROM training_examples WHERE is_spam = FALSE ORDER BY id DESC LIMIT ?",
-        (half,), fetch='all'
+        "SELECT text, is_spam FROM training_examples WHERE is_spam = ? ORDER BY id DESC LIMIT ?",
+        (False, half), fetch='all'
     ) or []
     return spam + not_spam
 

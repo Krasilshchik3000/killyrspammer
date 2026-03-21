@@ -531,13 +531,18 @@ async def ban_and_report(message: types.Message, result: SpamResult):
         await send_to_admin(message, result)
         return
 
+    # Удаляем ВСЕ сообщения спамера из всех групп
+    deleted = await delete_user_messages(uid)
+    logger.info(f"Удалено {deleted} сообщений спамера {uid}")
+
     text = (
         f"🔴 <b>АВТОБАН ЗА СПАМ</b>\n\n"
         f"<b>Забанен:</b> {message.from_user.full_name} (@{message.from_user.username or 'n/a'})\n"
         f"<b>User ID:</b> <code>{uid}</code>\n"
         f"<b>Группа:</b> {message.chat.title}\n\n"
         f"<b>Сообщение:</b>\n<code>{message.text}</code>\n\n"
-        f"✅ Забанен в {len(banned) + 1} группах"
+        f"✅ Забанен в {len(banned) + 1} группах\n"
+        f"🗑 Удалено сообщений: {deleted}"
     )
     if failed:
         text += f"\n⚠️ Не удалось в {len(failed)} группах"
@@ -568,7 +573,9 @@ async def handle_forwarded_spam(message: types.Message):
     elif message.forward_from_chat:
         original_username = message.forward_from_chat.title
 
-    db.add_training_example(message.text, True, 'FORWARDED_SPAM')
+    spam_text = message.text or message.caption or ""
+    if spam_text:
+        db.add_training_example(spam_text, True, 'FORWARDED_SPAM')
 
     parts = [f"🔄 Обрабатываю спам от <b>{original_username or 'неизвестного'}</b>"]
 
@@ -582,7 +589,8 @@ async def handle_forwarded_spam(message: types.Message):
     await message.reply("\n".join(parts), parse_mode='HTML')
 
     # Запускаем автоулучшение
-    await maybe_trigger_improvement("missed_spam", message.text)
+    if spam_text:
+        await maybe_trigger_improvement("missed_spam", spam_text)
 
 
 # ──────────────────────────────────────────────
@@ -608,6 +616,7 @@ async def cmd_help(message: types.Message):
         "/history — история версий промпта\n"
         "/rollback N — откатить промпт к версии #N\n"
         "/editprompt — ручное редактирование промпта\n"
+        "/resetprompt — сбросить промпт на дефолтный\n"
         "/groups — список групп\n"
         "/cancel — отменить редактирование\n\n"
         "💡 Пересылайте пропущенный спам боту\n"
@@ -675,6 +684,13 @@ async def cmd_editprompt(message: types.Message):
         "/cancel для отмены",
         parse_mode='HTML'
     )
+
+
+@dp.message(Command("resetprompt"))
+@require_admin
+async def cmd_resetprompt(message: types.Message):
+    db.save_prompt_version(db.DEFAULT_PROMPT, "Сброс на дефолтный промпт")
+    await message.reply("✅ Промпт сброшен на дефолтный")
 
 
 @dp.message(Command("groups"))
@@ -898,6 +914,7 @@ async def main():
         BotCommand(command="history", description="История промптов (админ)"),
         BotCommand(command="rollback", description="Откат промпта (админ)"),
         BotCommand(command="editprompt", description="Редактировать промпт (админ)"),
+        BotCommand(command="resetprompt", description="Сбросить промпт (админ)"),
         BotCommand(command="groups", description="Список групп (админ)"),
         BotCommand(command="cancel", description="Отменить"),
     ]
