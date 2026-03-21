@@ -135,17 +135,16 @@ class TestValidatePrompt:
         from main import validate_prompt
         self.validate = validate_prompt
 
-    def test_valid_prompt(self):
-        prompt = "Ответь СПАМ, НЕ_СПАМ или ВОЗМОЖНО_СПАМ. Сообщение: {message_text}"
+    def test_valid_prompt_russian(self):
+        prompt = "Ответь СПАМ, НЕ_СПАМ или ВОЗМОЖНО_СПАМ."
         assert self.validate(prompt) == []
 
-    def test_missing_message_text(self):
-        prompt = "Ответь СПАМ, НЕ_СПАМ или ВОЗМОЖНО_СПАМ"
-        problems = self.validate(prompt)
-        assert any("message_text" in p for p in problems)
+    def test_valid_prompt_english(self):
+        prompt = "Classify as SPAM, NOT_SPAM or MAYBE_SPAM."
+        assert self.validate(prompt) == []
 
     def test_missing_categories(self):
-        prompt = "Сообщение: {message_text}"
+        prompt = "Просто текст без категорий"
         problems = self.validate(prompt)
         assert len(problems) == 3  # Все три категории отсутствуют
 

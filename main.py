@@ -21,6 +21,7 @@ import httpx
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+import json as json_module
 from openai import AsyncOpenAI
 
 from config import (
@@ -31,6 +32,7 @@ from config import (
     AUTO_IMPROVE_AFTER_ERRORS, MIN_VALIDATION_EXAMPLES, MAX_VALIDATION_EXAMPLES,
 )
 import database as db
+from text_normalize import normalize_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -92,7 +94,20 @@ def check_rate_limit(user_id: int) -> bool:
 
 
 def parse_llm_response(response_text: str) -> SpamResult:
-    cleaned = re.sub(r'[^\w\s_]', '', response_text.strip().upper())
+    """Парсит ответ LLM (свободный текст или JSON)."""
+    text = response_text.strip()
+
+    # Попробовать JSON (structured output)
+    try:
+        parsed = json_module.loads(text)
+        result_key = parsed.get("result", "")
+        if result_key in _STRUCTURED_MAP:
+            return _STRUCTURED_MAP[result_key]
+    except (json_module.JSONDecodeError, AttributeError):
+        pass
+
+    # Fallback: парсинг свободного текста
+    cleaned = re.sub(r'[^\w\s_]', '', text.upper())
     if len(cleaned) < 3:
         return SpamResult.MAYBE_SPAM
 
@@ -103,9 +118,9 @@ def parse_llm_response(response_text: str) -> SpamResult:
     }
     if cleaned in exact:
         return exact[cleaned]
-    if 'ВОЗМОЖНО' in cleaned:
+    if 'ВОЗМОЖНО' in cleaned or 'MAYBE' in cleaned:
         return SpamResult.MAYBE_SPAM
-    if 'НЕ_СПАМ' in cleaned or 'НЕ СПАМ' in cleaned or 'NOT' in cleaned:
+    if 'НЕ_СПАМ' in cleaned or 'НЕ СПАМ' in cleaned or 'NOT_SPAM' in cleaned:
         return SpamResult.NOT_SPAM
     if 'СПАМ' in cleaned or 'SPAM' in cleaned:
         return SpamResult.SPAM
@@ -130,18 +145,25 @@ def safe_format_prompt(template: str, message_text: str, few_shot_block: str) ->
         return template.format(message_text=safe_text, few_shot_block=few_shot_block)
     except KeyError:
         try:
-            return template.format(message_text=safe_text)
+            return template.format(few_shot_block=few_shot_block)
         except KeyError:
-            return template.replace("{message_text}", safe_text)
+            result = template.replace("{few_shot_block}", few_shot_block)
+            result = result.replace("{message_text}", safe_text)
+            return result
 
 
 def validate_prompt(prompt_text: str) -> list[str]:
     problems = []
-    if "{message_text}" not in prompt_text:
-        problems.append("Нет {message_text}")
-    for kw in ("СПАМ", "НЕ_СПАМ", "ВОЗМОЖНО_СПАМ"):
-        if kw not in prompt_text:
-            problems.append(f"Нет {kw}")
+    # Проверяем наличие категорий (в любом формате — русском или английском)
+    has_spam = "SPAM" in prompt_text.upper() or "СПАМ" in prompt_text
+    has_not_spam = "NOT_SPAM" in prompt_text or "НЕ_СПАМ" in prompt_text
+    has_maybe = "MAYBE_SPAM" in prompt_text or "ВОЗМОЖНО_СПАМ" in prompt_text
+    if not has_spam:
+        problems.append("Нет SPAM/СПАМ")
+    if not has_not_spam:
+        problems.append("Нет NOT_SPAM/НЕ_СПАМ")
+    if not has_maybe:
+        problems.append("Нет MAYBE_SPAM/ВОЗМОЖНО_СПАМ")
     return problems
 
 
@@ -159,8 +181,36 @@ async def check_cas_ban(user_id: int) -> bool:
 
 
 # ──────────────────────────────────────────────
-# LLM: классификация
+# LLM: классификация (hardened)
 # ──────────────────────────────────────────────
+
+# Structured output schema — модель ФИЗИЧЕСКИ не может ответить ничего другого
+CLASSIFICATION_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "spam_classification",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "result": {
+                    "type": "string",
+                    "enum": ["SPAM", "NOT_SPAM", "MAYBE_SPAM"]
+                }
+            },
+            "required": ["result"],
+            "additionalProperties": False,
+        }
+    }
+}
+
+# Маппинг structured output → SpamResult
+_STRUCTURED_MAP = {
+    "SPAM": SpamResult.SPAM,
+    "NOT_SPAM": SpamResult.NOT_SPAM,
+    "MAYBE_SPAM": SpamResult.MAYBE_SPAM,
+}
+
 
 async def classify_message(
     prompt_template: str,
@@ -169,30 +219,62 @@ async def classify_message(
     user_msg_count: int = 0,
     is_cas_banned: bool = False,
 ) -> SpamResult:
-    """Классификация одного сообщения заданным промптом. Вынесена для переиспользования в валидации."""
-    prompt = safe_format_prompt(prompt_template, message_text, few_shot)
+    """Классификация сообщения с защитой от prompt injection.
 
-    # Добавляем контекст (только если передан)
-    context_lines = []
+    Защита:
+    1. Текст нормализуется (гомоглифы, zero-width, Zalgo)
+    2. System prompt содержит инструкции классификации
+    3. User prompt содержит только сообщение в XML-тегах (sandwich defense)
+    4. Structured output (JSON enum) — модель не может ответить произвольным текстом
+    """
+    # Нормализация текста
+    normalized = normalize_text(message_text)
+
+    # System prompt: инструкции + few-shot (доверенный контекст)
+    system_prompt = safe_format_prompt(prompt_template, "", few_shot)
+    # Убираем пустое «Сообщение: «»» из system prompt
+    system_prompt = system_prompt.replace("Сообщение: «»", "").strip()
+
+    # Контекст пользователя
+    context_parts = []
     if user_msg_count > 0:
-        context_lines.append(f"Контекст: пользователь ранее написал {user_msg_count} сообщений (снижает вероятность спама).")
+        context_parts.append(f"user_messages_in_group: {user_msg_count}")
     if is_cas_banned:
-        context_lines.append("Контекст: пользователь найден в антиспам-базе CAS (СИЛЬНО повышает вероятность спама).")
-    if context_lines:
-        context = "\n".join(context_lines) + "\n"
-        safe_text = message_text.replace("{", "{{").replace("}", "}}")
-        prompt = prompt.replace(f"Сообщение: «{safe_text}»", f"{context}Сообщение: «{safe_text}»")
+        context_parts.append("cas_banned: true")
+    context_xml = ""
+    if context_parts:
+        context_xml = "<context>\n" + "\n".join(context_parts) + "\n</context>\n"
+
+    # User prompt: sandwich defense с XML-тегами
+    user_prompt = (
+        f"{context_xml}"
+        f"<message>\n{normalized}\n</message>\n\n"
+        f"Classify the message above. Respond with JSON."
+    )
 
     response = await openai_client.chat.completions.create(
         model=LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format=CLASSIFICATION_SCHEMA,
         **_token_limit_param(LLM_MAX_TOKENS),
         temperature=LLM_TEMPERATURE,
         timeout=LLM_TIMEOUT,
     )
     raw = response.choices[0].message.content.strip()
-    result = parse_llm_response(raw)
-    logger.info(f"LLM raw response: '{raw}' → {result.value}")
+
+    # Parse structured output
+    try:
+        parsed = json_module.loads(raw)
+        result_key = parsed.get("result", "MAYBE_SPAM")
+        result = _STRUCTURED_MAP.get(result_key, SpamResult.MAYBE_SPAM)
+    except (json_module.JSONDecodeError, AttributeError):
+        # Fallback: parse as free text (для совместимости со старыми моделями)
+        result = parse_llm_response(raw)
+
+    logger.info(f"LLM raw: '{raw}' → {result.value}")
     return result
 
 
@@ -283,9 +365,10 @@ async def generate_improved_prompt(error_type: str, message_text: str) -> tuple[
 
 ПРАВИЛА:
 1. Сохрани ВСЕ существующие критерии, исключения и структуру. Только дополни/уточни.
-2. Промпт ОБЯЗАН содержать шаблонные переменные: {{{{message_text}}}} и {{{{few_shot_block}}}}
-3. Промпт ОБЯЗАН содержать три варианта ответа: СПАМ, НЕ_СПАМ, ВОЗМОЖНО_СПАМ
-4. Если ошибка — ложное срабатывание, добавь исключение чтобы подобные сообщения НЕ считались спамом.
+2. Промпт ОБЯЗАН содержать {{{{few_shot_block}}}} для вставки примеров.
+3. Промпт ОБЯЗАН содержать три варианта: SPAM, NOT_SPAM, MAYBE_SPAM.
+4. Промпт используется как system prompt. Сообщение пользователя передаётся отдельно в теге <message>.
+5. Если ошибка — ложное срабатывание, добавь исключение чтобы подобные сообщения НЕ считались спамом.
 
 Ответь СТРОГО в формате (два блока, разделённых маркером):
 

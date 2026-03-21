@@ -48,10 +48,10 @@ class TestInitDatabase:
     def test_inserts_default_prompt(self):
         """При пустой БД вставляется дефолтный промпт."""
         prompt = db.get_current_prompt()
-        assert "{message_text}" in prompt
-        assert "СПАМ" in prompt
-        assert "НЕ_СПАМ" in prompt
-        assert "ВОЗМОЖНО_СПАМ" in prompt
+        assert "{few_shot_block}" in prompt
+        assert "SPAM" in prompt or "СПАМ" in prompt
+        assert "NOT_SPAM" in prompt or "НЕ_СПАМ" in prompt
+        assert "MAYBE_SPAM" in prompt or "ВОЗМОЖНО_СПАМ" in prompt
 
 
 class TestPromptVersioning:
