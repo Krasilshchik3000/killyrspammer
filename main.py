@@ -17,6 +17,7 @@ from datetime import datetime
 from enum import Enum
 from functools import wraps
 
+import html
 import httpx
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
@@ -480,7 +481,7 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
                     f"🔄 <b>Промпт НЕ обновлён (не прошёл валидацию)</b>\n\n"
                     f"Текущий: {current_acc:.0%} ({current_ok}/{current_total})\n"
                     f"Новый: {new_acc:.0%} ({new_ok}/{new_total})\n\n"
-                    f"Анализ ошибки: {analysis}\n"
+                    f"Анализ ошибки: {html.escape(analysis or '')}\n"
                     f"Few-shot примеры продолжают учитывать это исправление."
                 )
                 await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
@@ -493,8 +494,8 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
                 f"✅ <b>Промпт автоматически обновлён</b>\n\n"
                 f"Было: {current_acc:.0%} ({current_ok}/{current_total})\n"
                 f"Стало: {new_acc:.0%} ({new_ok}/{new_total})\n\n"
-                f"Причина: {analysis}\n\n"
-                f"<code>{improved[:500]}{'...' if len(improved) > 500 else ''}</code>\n\n"
+                f"Причина: {html.escape(analysis or '')}\n\n"
+                f"<code>{html.escape(improved[:500])}{'...' if len(improved) > 500 else ''}</code>\n\n"
                 f"Откатить: /rollback (из /history)"
             )
             await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
@@ -505,7 +506,7 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
 
             report = (
                 f"✅ <b>Промпт обновлён</b> (мало данных для валидации: {examples_count}/{MIN_VALIDATION_EXAMPLES})\n\n"
-                f"Причина: {analysis}\n\n"
+                f"Причина: {html.escape(analysis or '')}\n\n"
                 f"Откатить: /rollback (из /history)"
             )
             await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
@@ -583,7 +584,7 @@ async def send_to_admin(message: types.Message, result: SpamResult):
         f"<b>От:</b> {message.from_user.full_name} (@{message.from_user.username or 'n/a'})\n"
         f"<b>Группа:</b> {message.chat.title}\n"
         f"<b>Время:</b> {message.date.strftime('%H:%M:%S')}\n\n"
-        f"<b>Сообщение:</b>\n<code>{message.text}</code>"
+        f"<b>Сообщение:</b>\n<code>{html.escape(message.text or '')}</code>"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🔴 СПАМ", callback_data=f"spam_{message.message_id}"),
@@ -623,7 +624,7 @@ async def ban_and_report(message: types.Message, result: SpamResult):
         f"<b>Забанен:</b> {message.from_user.full_name} (@{message.from_user.username or 'n/a'})\n"
         f"<b>User ID:</b> <code>{uid}</code>\n"
         f"<b>Группа:</b> {message.chat.title}\n\n"
-        f"<b>Сообщение:</b>\n<code>{message.text}</code>\n\n"
+        f"<b>Сообщение:</b>\n<code>{html.escape(message.text or '')}</code>\n\n"
         f"✅ Забанен в {len(banned) + 1} группах\n"
         f"🗑 Удалено сообщений: {deleted}"
     )
@@ -660,7 +661,7 @@ async def handle_forwarded_spam(message: types.Message):
     if spam_text:
         db.add_training_example(spam_text, True, 'FORWARDED_SPAM')
 
-    parts = [f"🔄 Обрабатываю спам от <b>{original_username or 'неизвестного'}</b>"]
+    parts = [f"🔄 Обрабатываю спам от <b>{html.escape(original_username or 'неизвестного')}</b>"]
 
     if original_user_id:
         deleted = await delete_user_messages(original_user_id)
@@ -726,7 +727,11 @@ async def cmd_stats(message: types.Message):
 @require_admin
 async def cmd_prompt(message: types.Message):
     current = db.get_current_prompt()
-    await message.reply(f"📝 <b>Текущий промпт:</b>\n\n<code>{current}</code>", parse_mode='HTML')
+    escaped = html.escape(current)
+    # Telegram limit 4096 chars
+    if len(escaped) > 3900:
+        escaped = escaped[:3900] + "\n\n... (обрезан)"
+    await message.reply(f"📝 <b>Текущий промпт:</b>\n\n<code>{escaped}</code>", parse_mode='HTML')
 
 
 @dp.message(Command("history"))
