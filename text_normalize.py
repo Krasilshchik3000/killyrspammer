@@ -167,8 +167,8 @@ def normalize_text(text: str) -> str:
     if not text:
         return text
 
-    # 1. Unicode NFC
-    text = unicodedata.normalize('NFC', text)
+    # 1. Unicode NFKC (stronger than NFC: fullwidth→ASCII, ligatures→components)
+    text = unicodedata.normalize('NFKC', text)
 
     # 2. Невидимые символы
     text = strip_invisible(text)
