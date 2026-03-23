@@ -197,9 +197,13 @@ CLASSIFICATION_SCHEMA = {
                 "result": {
                     "type": "string",
                     "enum": ["SPAM", "NOT_SPAM", "MAYBE_SPAM"]
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "Brief explanation why this classification was chosen (1-2 sentences)"
                 }
             },
-            "required": ["result"],
+            "required": ["result", "reasoning"],
             "additionalProperties": False,
         }
     }
@@ -219,7 +223,7 @@ async def classify_message(
     few_shot: str = "",
     user_msg_count: int = 0,
     is_cas_banned: bool = False,
-) -> SpamResult:
+) -> tuple[SpamResult, str]:
     """Классификация сообщения с защитой от prompt injection.
 
     Защита:
@@ -267,16 +271,18 @@ async def classify_message(
     raw = response.choices[0].message.content.strip()
 
     # Parse structured output
+    reasoning = ""
     try:
         parsed = json_module.loads(raw)
         result_key = parsed.get("result", "MAYBE_SPAM")
         result = _STRUCTURED_MAP.get(result_key, SpamResult.MAYBE_SPAM)
+        reasoning = parsed.get("reasoning", "")
     except (json_module.JSONDecodeError, AttributeError):
         # Fallback: parse as free text (для совместимости со старыми моделями)
         result = parse_llm_response(raw)
 
     logger.info(f"LLM raw: '{raw}' → {result.value}")
-    return result
+    return result, reasoning
 
 
 async def check_message_with_llm(
@@ -284,20 +290,20 @@ async def check_message_with_llm(
     user_id: int = None,
     user_msg_count: int = 0,
     is_cas_banned: bool = False,
-) -> SpamResult:
+) -> tuple[SpamResult, str]:
     if user_id and not check_rate_limit(user_id):
-        return SpamResult.MAYBE_SPAM
+        return SpamResult.MAYBE_SPAM, "Rate limit exceeded"
 
     prompt_template = db.get_current_prompt()
     few_shot = build_few_shot_block()
 
     try:
-        result = await classify_message(prompt_template, message_text, few_shot, user_msg_count, is_cas_banned)
+        result, reasoning = await classify_message(prompt_template, message_text, few_shot, user_msg_count, is_cas_banned)
         logger.info(f"LLM → {result.value} (len={len(message_text)}, msgs={user_msg_count}, cas={is_cas_banned})")
-        return result
+        return result, reasoning
     except Exception as e:
         logger.error(f"LLM error: {e}")
-        return SpamResult.MAYBE_SPAM
+        return SpamResult.MAYBE_SPAM, f"Error: {e}"
 
 
 # ──────────────────────────────────────────────
@@ -317,7 +323,7 @@ async def evaluate_prompt(prompt_template: str, examples: list) -> tuple[float, 
 
     for text, is_spam in examples:
         try:
-            result = await classify_message(prompt_template, text)
+            result, _ = await classify_message(prompt_template, text)
             # СПАМ или ВОЗМОЖНО_СПАМ считаем за "спам" при is_spam=True
             predicted_spam = result in (SpamResult.SPAM, SpamResult.MAYBE_SPAM)
             actual_spam = bool(is_spam)
@@ -577,14 +583,16 @@ async def delete_user_messages(user_id: int) -> int:
     return deleted
 
 
-async def send_to_admin(message: types.Message, result: SpamResult):
+async def send_to_admin(message: types.Message, result: SpamResult, reasoning: str = ""):
     emoji = "🔴" if result == SpamResult.SPAM else "🟡"
+    reasoning_line = f"\n\n💭 <i>{html.escape(reasoning[:200])}</i>" if reasoning else ""
     text = (
         f"{emoji} <b>{result.value}</b>\n\n"
         f"<b>От:</b> {message.from_user.full_name} (@{message.from_user.username or 'n/a'})\n"
         f"<b>Группа:</b> {message.chat.title}\n"
         f"<b>Время:</b> {message.date.strftime('%H:%M:%S')}\n\n"
         f"<b>Сообщение:</b>\n<code>{html.escape(message.text or '')}</code>"
+        f"{reasoning_line}"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🔴 СПАМ", callback_data=f"spam_{message.message_id}"),
@@ -596,14 +604,14 @@ async def send_to_admin(message: types.Message, result: SpamResult):
         logger.error(f"Ошибка отправки админу: {e}")
 
 
-async def ban_and_report(message: types.Message, result: SpamResult):
+async def ban_and_report(message: types.Message, result: SpamResult, reasoning: str = ""):
     uid, cid = message.from_user.id, message.chat.id
 
     if message.sender_chat:
-        await send_to_admin(message, result)
+        await send_to_admin(message, result, reasoning)
         return
     if db.has_user_old_activity(uid, cid, 10):
-        await send_to_admin(message, result)
+        await send_to_admin(message, result, reasoning)
         return
 
     try:
@@ -628,6 +636,8 @@ async def ban_and_report(message: types.Message, result: SpamResult):
         f"✅ Забанен в {len(banned) + 1} группах\n"
         f"🗑 Удалено сообщений: {deleted}"
     )
+    if reasoning:
+        text += f"\n\n💭 <i>{html.escape(reasoning[:200])}</i>"
     if failed:
         text += f"\n⚠️ Не удалось в {len(failed)} группах"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
@@ -859,19 +869,19 @@ async def handle_message(message: types.Message):
         await ban_and_report(message, SpamResult.SPAM)
         return
 
-    result = await check_message_with_llm(message.text, uid, user_msg_count, is_cas_banned)
+    result, reasoning = await check_message_with_llm(message.text, uid, user_msg_count, is_cas_banned)
     emoji = {"СПАМ": "🔴", "ВОЗМОЖНО_СПАМ": "🟡", "НЕ_СПАМ": "🟢"}[result.value]
-    logger.info(f"{emoji} LLM→{result.value} @{username} (msgs={user_msg_count}, cas={is_cas_banned}) | {message.chat.title} | «{text_preview}»")
+    logger.info(f"{emoji} LLM→{result.value} @{username} (msgs={user_msg_count}, cas={is_cas_banned}) | {message.chat.title} | «{text_preview}» | reason: {reasoning[:100]}")
 
     try:
-        db.save_message(message.message_id, cid, uid, message.from_user.username or '', message.text, result.value)
+        db.save_message(message.message_id, cid, uid, message.from_user.username or '', message.text, result.value, reasoning)
     except Exception as e:
         logger.error(f"Ошибка сохранения: {e}")
 
     if result == SpamResult.SPAM:
-        await ban_and_report(message, result)
+        await ban_and_report(message, result, reasoning)
     elif result == SpamResult.MAYBE_SPAM:
-        await send_to_admin(message, result)
+        await send_to_admin(message, result, reasoning)
 
 
 # ──────────────────────────────────────────────
@@ -897,7 +907,7 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
         await callback.answer("❌ Не найдено в БД")
         return
 
-    message_text, llm_result, user_id, chat_id = row
+    message_text, llm_result, user_id, chat_id, reasoning = row
     decision = "СПАМ" if action == "spam" else "НЕ_СПАМ"
     is_spam = action == "spam"
 
@@ -919,7 +929,8 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
             ban_info = "\n⚠️ Ошибка бана"
 
     emoji = "❌" if is_spam else "✅"
-    new_text = f"{callback.message.text}\n\n{emoji} <b>Решение: {decision}</b>{ban_info}"
+    reasoning_line = f"\n💭 Бот думал: {html.escape(reasoning[:150])}" if reasoning else ""
+    new_text = f"{callback.message.text}\n\n{emoji} <b>Решение: {decision}</b>{ban_info}{reasoning_line}"
     try:
         await callback.message.edit_text(new_text, parse_mode='HTML')
     except Exception:

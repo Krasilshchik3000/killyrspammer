@@ -101,8 +101,8 @@ class TestEvaluatePrompt:
         # Мокаем classify_message чтобы всегда возвращал правильный ответ
         async def mock_classify(prompt, text, few_shot="", umc=0, cas=False):
             if "spam" in text:
-                return SpamResult.SPAM
-            return SpamResult.NOT_SPAM
+                return SpamResult.SPAM, "contains spam keyword"
+            return SpamResult.NOT_SPAM, "looks clean"
 
         with patch('main.classify_message', side_effect=mock_classify):
             examples = [("spam_1", True), ("spam_2", True), ("ham_1", False), ("ham_2", False)]
@@ -122,8 +122,9 @@ class TestEvaluatePrompt:
             call_count += 1
             # Первые два правильно, остальные нет
             if call_count <= 2:
-                return SpamResult.SPAM if "spam" in text else SpamResult.NOT_SPAM
-            return SpamResult.NOT_SPAM  # Всегда НЕ_СПАМ — ошибка на спаме
+                r = SpamResult.SPAM if "spam" in text else SpamResult.NOT_SPAM
+                return r, "reason"
+            return SpamResult.NOT_SPAM, "reason"  # Всегда НЕ_СПАМ — ошибка на спаме
 
         with patch('main.classify_message', side_effect=mock_classify):
             examples = [("spam_1", True), ("ham_1", False), ("spam_2", True), ("spam_3", True)]

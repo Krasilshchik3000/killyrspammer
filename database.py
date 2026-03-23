@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS messages (
     text TEXT,
     created_at TIMESTAMP,
     llm_result TEXT,
+    reasoning TEXT,
     admin_decision TEXT,
     admin_decided_at TIMESTAMP
 );
@@ -112,6 +113,7 @@ CREATE TABLE IF NOT EXISTS messages (
     text TEXT,
     created_at TIMESTAMP,
     llm_result TEXT,
+    reasoning TEXT,
     admin_decision TEXT,
     admin_decided_at TIMESTAMP
 );
@@ -233,6 +235,17 @@ def init_database():
             )
             logger.info("Обновлён устаревший промпт на новую версию")
 
+    # Миграция: добавить колонку reasoning если её нет
+    try:
+        cursor.execute("SELECT reasoning FROM messages LIMIT 1")
+    except Exception:
+        conn.rollback()
+        try:
+            cursor.execute("ALTER TABLE messages ADD COLUMN reasoning TEXT")
+            logger.info("Добавлена колонка reasoning в messages")
+        except Exception:
+            conn.rollback()
+
     conn.commit()
     conn.close()
     logger.info("БД инициализирована")
@@ -318,21 +331,26 @@ def count_errors_since_last_improvement() -> int:
         "SELECT created_at FROM prompt_versions ORDER BY id DESC LIMIT 1",
         fetch='one'
     )
+    # Ошибки = любое расхождение между LLM и админом:
+    # - missed_spam: НЕ_СПАМ → СПАМ
+    # - false_positive: СПАМ/ВОЗМОЖНО_СПАМ → НЕ_СПАМ
+    # - uncertain_spam: ВОЗМОЖНО_СПАМ → СПАМ (бот не уверен, а это точно спам)
+    _ERR = (
+        "((llm_result = 'НЕ_СПАМ' AND admin_decision = 'СПАМ') "
+        "  OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'НЕ_СПАМ') "
+        "  OR (llm_result = 'ВОЗМОЖНО_СПАМ' AND admin_decision = 'СПАМ'))"
+    )
+
     if not last_improvement or not last_improvement[0]:
-        # Нет промптов — считаем все ошибки
         row = execute_query(
-            "SELECT COUNT(*) FROM messages WHERE admin_decision IS NOT NULL "
-            "AND ((llm_result = 'НЕ_СПАМ' AND admin_decision = 'СПАМ') "
-            "  OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'НЕ_СПАМ'))",
+            "SELECT COUNT(*) FROM messages WHERE admin_decision IS NOT NULL AND " + _ERR,
             fetch='one'
         )
         return row[0] if row else 0
 
     row = execute_query(
         "SELECT COUNT(*) FROM messages WHERE admin_decision IS NOT NULL "
-        "AND admin_decided_at > ? "
-        "AND ((llm_result = 'НЕ_СПАМ' AND admin_decision = 'СПАМ') "
-        "  OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'НЕ_СПАМ'))",
+        "AND admin_decided_at > ? AND " + _ERR,
         (last_improvement[0],), fetch='one'
     )
     return row[0] if row else 0
@@ -347,11 +365,11 @@ def count_training_examples() -> int:
 # Сообщения
 # ──────────────────────────────────────────────
 
-def save_message(message_id, chat_id, user_id, username, text, llm_result=None):
+def save_message(message_id, chat_id, user_id, username, text, llm_result=None, reasoning=None):
     execute_query(
-        """INSERT INTO messages (message_id, chat_id, user_id, username, text, created_at, llm_result)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (message_id, chat_id, user_id, username, text, datetime.now(), llm_result)
+        """INSERT INTO messages (message_id, chat_id, user_id, username, text, created_at, llm_result, reasoning)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (message_id, chat_id, user_id, username, text, datetime.now(), llm_result, reasoning)
     )
 
 
@@ -364,7 +382,7 @@ def update_admin_decision(message_id: int, decision: str):
 
 def get_message_by_id(message_id: int):
     return execute_query(
-        "SELECT text, llm_result, user_id, chat_id FROM messages WHERE message_id = ?",
+        "SELECT text, llm_result, user_id, chat_id, reasoning FROM messages WHERE message_id = ?",
         (message_id,), fetch='one'
     )
 
