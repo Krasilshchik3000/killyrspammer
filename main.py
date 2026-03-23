@@ -670,8 +670,24 @@ async def handle_forwarded_spam(message: types.Message):
     spam_text = message.text or message.caption or ""
     if spam_text:
         db.add_training_example(spam_text, True, 'FORWARDED_SPAM')
+        # Сохраняем как "ошибку бота" чтобы счётчик ошибок рос
+        try:
+            db.save_message(
+                message.message_id, 0, original_user_id or 0,
+                original_username or '', spam_text, 'НЕ_СПАМ', 'Пропущен ботом'
+            )
+            db.update_admin_decision(message.message_id, 'СПАМ')
+        except Exception as e:
+            logger.warning(f"Не удалось сохранить forwarded spam в messages: {e}")
 
     parts = [f"🔄 Обрабатываю спам от <b>{html.escape(original_username or 'неизвестного')}</b>"]
+
+    if not original_user_id and spam_text:
+        # Попробуем найти автора по тексту сообщения в БД
+        found = db.find_user_by_message_text(spam_text)
+        if found:
+            original_user_id = found
+            parts.append(f"🔍 Найден автор по тексту: <code>{original_user_id}</code>")
 
     if original_user_id:
         deleted = await delete_user_messages(original_user_id)

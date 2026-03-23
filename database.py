@@ -395,6 +395,15 @@ def get_user_messages(user_id: int, limit=100):
     ) or []
 
 
+def find_user_by_message_text(text: str):
+    """Найти user_id по точному тексту сообщения (для forwarded spam без user_id)."""
+    row = execute_query(
+        "SELECT user_id FROM messages WHERE text = ? AND user_id > 0 ORDER BY created_at DESC LIMIT 1",
+        (text,), fetch='one'
+    )
+    return row[0] if row else None
+
+
 def get_recent_mistakes(limit=10):
     return execute_query(
         """SELECT text, llm_result, admin_decision, created_at
