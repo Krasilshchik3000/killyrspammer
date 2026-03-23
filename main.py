@@ -31,6 +31,7 @@ from config import (
     LLM_TEMPERATURE, LLM_TIMEOUT, MAX_REQUESTS_PER_MINUTE,
     FEW_SHOT_EXAMPLES_COUNT, CAS_API_URL, TRUSTED_USER_MESSAGES,
     AUTO_IMPROVE_AFTER_ERRORS, MIN_VALIDATION_EXAMPLES, MAX_VALIDATION_EXAMPLES,
+    MAX_IMPROVEMENT_ATTEMPTS,
 )
 import database as db
 from text_normalize import normalize_text
@@ -337,8 +338,14 @@ async def evaluate_prompt(prompt_template: str, examples: list) -> tuple[float, 
     return accuracy, correct, total
 
 
-async def generate_improved_prompt(error_type: str, message_text: str) -> tuple[str, str] | tuple[None, None]:
-    """Генерирует улучшенный промпт. Возвращает (analysis, improved_prompt) или (None, None)."""
+async def generate_improved_prompt(
+    error_type: str, message_text: str,
+    failed_attempts: list[tuple[str, float | None]] | None = None
+) -> tuple[str, str] | tuple[None, None]:
+    """Генерирует улучшенный промпт. Возвращает (analysis, improved_prompt) или (None, None).
+
+    failed_attempts: список предыдущих неудачных попыток [(analysis, accuracy), ...]
+    """
     current_prompt = db.get_current_prompt()
 
     descriptions = {
@@ -356,6 +363,17 @@ async def generate_improved_prompt(error_type: str, message_text: str) -> tuple[
             lines.append(f"  - «{text[:80]}» — бот: {bot_dec}, правильно: {admin_dec}")
         mistakes_block = "\n".join(lines)
 
+    # Контекст предыдущих неудачных попыток
+    failed_block = ""
+    if failed_attempts:
+        lines = ["ПРЕДЫДУЩИЕ НЕУДАЧНЫЕ ПОПЫТКИ (не повторяй те же подходы!):"]
+        for i, (reason, acc) in enumerate(failed_attempts):
+            acc_str = f"{acc:.0%}" if acc is not None else "❌"
+            lines.append(f"  Попытка {i+1} (точность: {acc_str}): {reason[:150]}")
+        lines.append("")
+        lines.append("Каждая новая попытка ДОЛЖНА использовать существенно другой подход.")
+        failed_block = "\n".join(lines)
+
     analysis_prompt = f"""Ты эксперт по созданию промптов для определения спама в Telegram-группах.
 
 ТЕКУЩИЙ ПРОМПТ (используется для классификации сообщений):
@@ -367,6 +385,8 @@ async def generate_improved_prompt(error_type: str, message_text: str) -> tuple[
 Проблемное сообщение: "{message_text}"
 
 {mistakes_block}
+
+{failed_block}
 
 ЗАДАЧА: Улучши промпт так, чтобы он правильно обрабатывал это и похожие сообщения.
 
@@ -441,13 +461,12 @@ async def generate_improved_prompt(error_type: str, message_text: str) -> tuple[
 
 
 async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
-    """Автоматическое улучшение промпта с валидацией.
+    """Итеративное улучшение промпта с валидацией.
 
-    Логика:
-    1. Генерирует улучшенный промпт
+    Цикл до MAX_IMPROVEMENT_ATTEMPTS попыток:
+    1. Генерирует улучшенный промпт (с контекстом предыдущих неудач)
     2. Оценивает текущий и новый на validation set
-    3. Применяет новый только если он не хуже
-    4. Отправляет отчёт админу
+    3. Если лучше — применяет. Если нет — пробует снова с анализом неудачи.
     """
     global _improvement_in_progress
     if _improvement_in_progress:
@@ -458,64 +477,84 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
         examples_count = db.count_training_examples()
         has_enough_for_validation = examples_count >= MIN_VALIDATION_EXAMPLES
 
-        # 1. Генерируем улучшенный промпт
-        analysis, improved = await generate_improved_prompt(trigger_error_type, trigger_message)
-        if not improved:
-            detail = f"\nАнализ LLM: {analysis[:300]}" if analysis else "\nLLM не вернул ответ"
-            await bot.send_message(ADMIN_ID, f"⚠️ Не удалось сгенерировать улучшенный промпт (LLM не вернул маркер ИТОГОВЫЙ_ПРОМПТ){detail}")
-            return
+        # Оцениваем текущий промпт один раз (для всех попыток)
+        current_prompt = db.get_current_prompt()
+        current_acc, current_ok, current_total = 0.0, 0, 0
+        validation_examples = []
 
-        problems = validate_prompt(improved)
-        if problems:
-            await bot.send_message(ADMIN_ID, f"⚠️ Сгенерированный промпт невалиден: {', '.join(problems)}")
-            return
-
-        # 2. Валидация на примерах (если достаточно данных)
         if has_enough_for_validation:
             validation_examples = db.get_validation_examples(MAX_VALIDATION_EXAMPLES)
-
-            current_prompt = db.get_current_prompt()
             current_acc, current_ok, current_total = await evaluate_prompt(current_prompt, validation_examples)
-            new_acc, new_ok, new_total = await evaluate_prompt(improved, validation_examples)
+            logger.info(f"Текущая точность: {current_acc:.0%} ({current_ok}/{current_total})")
 
-            logger.info(f"Валидация: текущий={current_acc:.0%} ({current_ok}/{current_total}), "
-                        f"новый={new_acc:.0%} ({new_ok}/{new_total})")
+        # Цикл попыток улучшения
+        failed_attempts = []  # [(analysis, accuracy), ...]
 
-            if new_acc <= current_acc:
-                # Новый промпт не лучше → НЕ применяем
+        for attempt in range(1, MAX_IMPROVEMENT_ATTEMPTS + 1):
+            logger.info(f"Попытка улучшения {attempt}/{MAX_IMPROVEMENT_ATTEMPTS}")
+
+            # Генерируем с контекстом предыдущих неудач
+            analysis, improved = await generate_improved_prompt(
+                trigger_error_type, trigger_message, failed_attempts
+            )
+            if not improved:
+                detail = f"\nАнализ LLM: {analysis[:300]}" if analysis else "\nLLM не вернул ответ"
+                failed_attempts.append((detail, None))
+                logger.warning(f"Попытка {attempt}: генерация не удалась")
+                continue
+
+            problems = validate_prompt(improved)
+            if problems:
+                failed_attempts.append((f"Невалидный промпт: {', '.join(problems)}", None))
+                logger.warning(f"Попытка {attempt}: промпт невалиден: {problems}")
+                continue
+
+            if not has_enough_for_validation:
+                # Мало примеров — применяем первый валидный промпт
+                db.save_prompt_version(improved, f"Авто (без валидации, {examples_count} примеров): {trigger_error_type}")
                 report = (
-                    f"🔄 <b>Промпт НЕ обновлён (не прошёл валидацию)</b>\n\n"
-                    f"Текущий: {current_acc:.0%} ({current_ok}/{current_total})\n"
-                    f"Новый: {new_acc:.0%} ({new_ok}/{new_total})\n\n"
-                    f"Анализ ошибки: {html.escape(analysis or '')}\n"
-                    f"Few-shot примеры продолжают учитывать это исправление."
+                    f"✅ <b>Промпт обновлён</b> (мало данных для валидации: {examples_count}/{MIN_VALIDATION_EXAMPLES})\n\n"
+                    f"Причина: {html.escape(analysis or '')}\n\n"
+                    f"Откатить: /rollback (из /history)"
                 )
                 await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
                 return
 
-            # Новый промпт не хуже → применяем
-            db.save_prompt_version(improved, f"Авто: {trigger_error_type} ({new_acc:.0%} vs {current_acc:.0%})")
+            # Валидация
+            new_acc, new_ok, new_total = await evaluate_prompt(improved, validation_examples)
+            logger.info(f"Попытка {attempt}: {new_acc:.0%} ({new_ok}/{new_total}) vs текущий {current_acc:.0%}")
 
-            report = (
-                f"✅ <b>Промпт автоматически обновлён</b>\n\n"
-                f"Было: {current_acc:.0%} ({current_ok}/{current_total})\n"
-                f"Стало: {new_acc:.0%} ({new_ok}/{new_total})\n\n"
-                f"Причина: {html.escape(analysis or '')}\n\n"
-                f"<code>{html.escape(improved[:500])}{'...' if len(improved) > 500 else ''}</code>\n\n"
-                f"Откатить: /rollback (из /history)"
-            )
-            await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
+            if new_acc > current_acc:
+                # Успех! Применяем
+                db.save_prompt_version(improved, f"Авто: {trigger_error_type} ({new_acc:.0%} vs {current_acc:.0%}, попытка {attempt})")
+                report = (
+                    f"✅ <b>Промпт автоматически обновлён</b>\n\n"
+                    f"Было: {current_acc:.0%} ({current_ok}/{current_total})\n"
+                    f"Стало: {new_acc:.0%} ({new_ok}/{new_total})\n"
+                    f"Попыток: {attempt}/{MAX_IMPROVEMENT_ATTEMPTS}\n\n"
+                    f"Причина: {html.escape(analysis or '')}\n\n"
+                    f"<code>{html.escape(improved[:500])}{'...' if len(improved) > 500 else ''}</code>\n\n"
+                    f"Откатить: /rollback (из /history)"
+                )
+                await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
+                return
 
-        else:
-            # Мало примеров для валидации — применяем без проверки, но предупреждаем
-            db.save_prompt_version(improved, f"Авто (без валидации, {examples_count} примеров): {trigger_error_type}")
+            # Не лучше — запоминаем и пробуем снова
+            failed_attempts.append((analysis, new_acc))
+            logger.info(f"Попытка {attempt}: не лучше ({new_acc:.0%} <= {current_acc:.0%}), продолжаем...")
 
-            report = (
-                f"✅ <b>Промпт обновлён</b> (мало данных для валидации: {examples_count}/{MIN_VALIDATION_EXAMPLES})\n\n"
-                f"Причина: {html.escape(analysis or '')}\n\n"
-                f"Откатить: /rollback (из /history)"
-            )
-            await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
+        # Все попытки исчерпаны
+        attempts_log = "\n".join(
+            f"  #{i+1}: {acc:.0%} — {reason[:80]}" if acc is not None else f"  #{i+1}: ❌ — {reason[:80]}"
+            for i, (reason, acc) in enumerate(failed_attempts)
+        )
+        report = (
+            f"🔄 <b>Промпт НЕ обновлён ({MAX_IMPROVEMENT_ATTEMPTS} попыток)</b>\n\n"
+            f"Текущий: {current_acc:.0%} ({current_ok}/{current_total})\n\n"
+            f"Попытки:\n<code>{html.escape(attempts_log)}</code>\n\n"
+            f"Few-shot примеры продолжают учитывать исправления."
+        )
+        await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
 
     except Exception as e:
         logger.error(f"Ошибка автоулучшения: {e}")

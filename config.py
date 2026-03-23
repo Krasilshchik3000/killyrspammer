@@ -59,6 +59,8 @@ AUTO_IMPROVE_AFTER_ERRORS = int(os.getenv("AUTO_IMPROVE_AFTER_ERRORS", "3"))
 MIN_VALIDATION_EXAMPLES = int(os.getenv("MIN_VALIDATION_EXAMPLES", "5"))
 # Максимум примеров для валидации (больше = точнее, но дороже)
 MAX_VALIDATION_EXAMPLES = int(os.getenv("MAX_VALIDATION_EXAMPLES", "30"))
+# Сколько попыток улучшить промпт за один цикл (каждая — вызов LLM)
+MAX_IMPROVEMENT_ATTEMPTS = int(os.getenv("MAX_IMPROVEMENT_ATTEMPTS", "5"))
 
 # Логирование
 LOG_LEVEL = "INFO"
