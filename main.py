@@ -481,8 +481,8 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
             logger.info(f"Валидация: текущий={current_acc:.0%} ({current_ok}/{current_total}), "
                         f"новый={new_acc:.0%} ({new_ok}/{new_total})")
 
-            if new_acc < current_acc:
-                # Новый промпт хуже → НЕ применяем
+            if new_acc <= current_acc:
+                # Новый промпт не лучше → НЕ применяем
                 report = (
                     f"🔄 <b>Промпт НЕ обновлён (не прошёл валидацию)</b>\n\n"
                     f"Текущий: {current_acc:.0%} ({current_ok}/{current_total})\n"
