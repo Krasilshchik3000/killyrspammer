@@ -36,7 +36,7 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "antispam.db")  # SQLite (локал�
 # gpt-5.4-mini: для улучшения промптов (мощнее, $0.75/1M)
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4-nano")
 LLM_IMPROVEMENT_MODEL = os.getenv("LLM_IMPROVEMENT_MODEL", "gpt-5.4-mini")
-LLM_MAX_TOKENS = 30
+LLM_MAX_TOKENS = 150  # Enough for {"result":"...","reasoning":"..."}
 LLM_TEMPERATURE = 0
 LLM_TIMEOUT = 10
 
