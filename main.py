@@ -286,19 +286,85 @@ async def classify_message(
     return result, reasoning
 
 
+async def classify_image(
+    image_url: str,
+    caption: str = "",
+    user_msg_count: int = 0,
+    is_cas_banned: bool = False,
+) -> tuple[SpamResult, str]:
+    """Классификация изображения через Vision API."""
+    system_prompt = (
+        "Ты антиспам-классификатор для Telegram-групп.\n"
+        "Тебе отправлено изображение из чата. Проанализируй текст на картинке и содержимое.\n"
+        "Классифицируй как SPAM, NOT_SPAM или MAYBE_SPAM.\n\n"
+        "SPAM: реклама товаров/услуг, продажа наркотиков, казино, криптоспам, "
+        "мошенничество, фишинг, ссылки на подозрительные сайты.\n"
+        "NOT_SPAM: мемы, фотографии, скриншоты бесед, обычный контент.\n"
+        "MAYBE_SPAM: неясно, нужна проверка админом."
+    )
+
+    context_parts = []
+    if user_msg_count > 0:
+        context_parts.append(f"user_messages_in_group: {user_msg_count}")
+    if is_cas_banned:
+        context_parts.append("cas_banned: true")
+    context_info = ", ".join(context_parts) if context_parts else "new user"
+
+    user_content = [
+        {"type": "image_url", "image_url": {"url": image_url, "detail": "low"}},
+    ]
+    text_part = f"Context: {context_info}."
+    if caption:
+        text_part += f"\nCaption: {normalize_text(caption)}"
+    text_part += "\nClassify this image. Respond with JSON."
+    user_content.append({"type": "text", "text": text_part})
+
+    response = await openai_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        response_format=CLASSIFICATION_SCHEMA,
+        **_token_limit_param(LLM_MAX_TOKENS),
+        temperature=LLM_TEMPERATURE,
+        timeout=LLM_TIMEOUT,
+    )
+    raw = response.choices[0].message.content.strip()
+
+    reasoning = ""
+    try:
+        parsed = json_module.loads(raw)
+        result_key = parsed.get("result", "MAYBE_SPAM")
+        result = _STRUCTURED_MAP.get(result_key, SpamResult.MAYBE_SPAM)
+        reasoning = parsed.get("reasoning", "")
+    except (json_module.JSONDecodeError, AttributeError):
+        result = parse_llm_response(raw)
+
+    logger.info(f"Vision LLM raw: '{raw}' → {result.value}")
+    return result, reasoning
+
+
 async def check_message_with_llm(
     message_text: str,
     user_id: int = None,
     user_msg_count: int = 0,
     is_cas_banned: bool = False,
+    photo_url: str = None,
 ) -> tuple[SpamResult, str]:
     if user_id and not check_rate_limit(user_id):
         return SpamResult.MAYBE_SPAM, "Rate limit exceeded"
 
-    prompt_template = db.get_current_prompt()
-    few_shot = build_few_shot_block()
-
     try:
+        # Если есть фото — используем Vision API
+        if photo_url:
+            result, reasoning = await classify_image(photo_url, message_text or "", user_msg_count, is_cas_banned)
+            logger.info(f"Vision → {result.value} (caption_len={len(message_text or '')}, msgs={user_msg_count})")
+            return result, reasoning
+
+        # Текстовая классификация
+        prompt_template = db.get_current_prompt()
+        few_shot = build_few_shot_block()
         result, reasoning = await classify_message(prompt_template, message_text, few_shot, user_msg_count, is_cas_banned)
         logger.info(f"LLM → {result.value} (len={len(message_text)}, msgs={user_msg_count}, cas={is_cas_banned})")
         return result, reasoning
@@ -630,7 +696,7 @@ async def send_to_admin(message: types.Message, result: SpamResult, reasoning: s
         f"<b>От:</b> {message.from_user.full_name} (@{message.from_user.username or 'n/a'})\n"
         f"<b>Группа:</b> {message.chat.title}\n"
         f"<b>Время:</b> {message.date.strftime('%H:%M:%S')}\n\n"
-        f"<b>Сообщение:</b>\n<code>{html.escape(message.text or '')}</code>"
+        f"<b>Сообщение:</b>\n<code>{html.escape(message.text or message.caption or '📷 [Фото без подписи]')}</code>"
         f"{reasoning_line}"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
@@ -638,7 +704,11 @@ async def send_to_admin(message: types.Message, result: SpamResult, reasoning: s
         InlineKeyboardButton(text="🟢 НЕ СПАМ", callback_data=f"not_spam_{message.message_id}"),
     ]])
     try:
-        await bot.send_message(ADMIN_ID, text, reply_markup=keyboard, parse_mode='HTML')
+        # Если есть фото — пересылаем его + текст кнопками
+        if message.photo:
+            await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=text, reply_markup=keyboard, parse_mode='HTML')
+        else:
+            await bot.send_message(ADMIN_ID, text, reply_markup=keyboard, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Ошибка отправки админу: {e}")
 
@@ -671,7 +741,7 @@ async def ban_and_report(message: types.Message, result: SpamResult, reasoning: 
         f"<b>Забанен:</b> {message.from_user.full_name} (@{message.from_user.username or 'n/a'})\n"
         f"<b>User ID:</b> <code>{uid}</code>\n"
         f"<b>Группа:</b> {message.chat.title}\n\n"
-        f"<b>Сообщение:</b>\n<code>{html.escape(message.text or '')}</code>\n\n"
+        f"<b>Сообщение:</b>\n<code>{html.escape(message.text or message.caption or '📷 [Фото без подписи]')}</code>\n\n"
         f"✅ Забанен в {len(banned) + 1} группах\n"
         f"🗑 Удалено сообщений: {deleted}"
     )
@@ -683,7 +753,10 @@ async def ban_and_report(message: types.Message, result: SpamResult, reasoning: 
         InlineKeyboardButton(text="🟢 НЕ СПАМ (разбанить)", callback_data=f"unban_{uid}_{cid}_{message.message_id}")
     ]])
     try:
-        await bot.send_message(ADMIN_ID, text, reply_markup=keyboard, parse_mode='HTML')
+        if message.photo:
+            await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=text, reply_markup=keyboard, parse_mode='HTML')
+        else:
+            await bot.send_message(ADMIN_ID, text, reply_markup=keyboard, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Ошибка отчёта: {e}")
 
@@ -889,7 +962,7 @@ async def handle_admin_text(message: types.Message):
 # Основной обработчик сообщений
 # ──────────────────────────────────────────────
 
-@dp.message(F.content_type == 'text')
+@dp.message(F.content_type.in_({'text', 'photo'}))
 async def handle_message(message: types.Message):
     if message.chat.type == 'private':
         return
@@ -900,16 +973,22 @@ async def handle_message(message: types.Message):
 
     uid, cid = message.from_user.id, message.chat.id
     username = message.from_user.username or message.from_user.full_name
-    text_preview = (message.text or '')[:80].replace('\n', ' ')
+    msg_text = message.text or message.caption or ""
+    text_preview = msg_text[:80].replace('\n', ' ')
+    has_photo = bool(message.photo)
     user_msg_count = db.count_user_messages(uid, cid)
 
     # Пользователь с историей сообщений — доверенный, не проверяем через LLM
     if user_msg_count >= TRUSTED_USER_MESSAGES:
         logger.info(f"✅ TRUSTED @{username} (msgs={user_msg_count}) | {message.chat.title} | «{text_preview}»")
         try:
-            db.save_message(message.message_id, cid, uid, message.from_user.username or '', message.text, "НЕ_СПАМ")
+            db.save_message(message.message_id, cid, uid, message.from_user.username or '', msg_text, "НЕ_СПАМ")
         except Exception:
             pass
+        return
+
+    # Если нет ни текста, ни фото — пропускаем
+    if not msg_text and not has_photo:
         return
 
     is_cas_banned = await check_cas_ban(uid)
@@ -918,18 +997,31 @@ async def handle_message(message: types.Message):
     if is_cas_banned and user_msg_count == 0:
         logger.info(f"🚫 CAS-BAN @{username} (cas=True, msgs=0) | {message.chat.title} | «{text_preview}»")
         try:
-            db.save_message(message.message_id, cid, uid, message.from_user.username or '', message.text, "СПАМ")
+            db.save_message(message.message_id, cid, uid, message.from_user.username or '', msg_text, "СПАМ")
         except Exception:
             pass
         await ban_and_report(message, SpamResult.SPAM)
         return
 
-    result, reasoning = await check_message_with_llm(message.text, uid, user_msg_count, is_cas_banned)
+    # Получаем URL фото если есть
+    photo_url = None
+    if has_photo:
+        try:
+            # Берём самое большое фото (последнее в массиве)
+            photo = message.photo[-1]
+            file_info = await bot.get_file(photo.file_id)
+            photo_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
+            logger.info(f"📷 Photo from @{username} | {message.chat.title} | caption: «{text_preview}»")
+        except Exception as e:
+            logger.error(f"Ошибка получения фото: {e}")
+
+    result, reasoning = await check_message_with_llm(msg_text, uid, user_msg_count, is_cas_banned, photo_url)
     emoji = {"СПАМ": "🔴", "ВОЗМОЖНО_СПАМ": "🟡", "НЕ_СПАМ": "🟢"}[result.value]
-    logger.info(f"{emoji} LLM→{result.value} @{username} (msgs={user_msg_count}, cas={is_cas_banned}) | {message.chat.title} | «{text_preview}» | reason: {reasoning[:100]}")
+    source = "Vision" if photo_url else "LLM"
+    logger.info(f"{emoji} {source}→{result.value} @{username} (msgs={user_msg_count}, cas={is_cas_banned}) | {message.chat.title} | «{text_preview}» | reason: {reasoning[:100]}")
 
     try:
-        db.save_message(message.message_id, cid, uid, message.from_user.username or '', message.text, result.value, reasoning)
+        db.save_message(message.message_id, cid, uid, message.from_user.username or '', msg_text, result.value, reasoning)
     except Exception as e:
         logger.error(f"Ошибка сохранения: {e}")
 
