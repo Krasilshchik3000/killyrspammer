@@ -182,6 +182,60 @@ async def check_cas_ban(user_id: int) -> bool:
         return False
 
 
+async def check_user_profile(user_id: int) -> str:
+    """Проверяет профиль пользователя на спам-сигналы.
+
+    Возвращает описание подозрительного контента или пустую строку.
+    """
+    try:
+        chat = await bot.get_chat(user_id)
+    except Exception:
+        return ""
+
+    signals = []
+
+    # Проверяем bio
+    bio = getattr(chat, 'bio', '') or ''
+    if bio:
+        # Подозрительные паттерны в bio
+        spam_keywords = [
+            'заработ', 'доход', 'прибыл', 'инвестиц', 'крипт', 'казино',
+            'ставк', 'букмекер', 'прогноз', 'сигнал', 'трейдинг', 'trading',
+            'crypto', 'forex', 'p2p', 'обмен валют', 'пассивный доход',
+            'промоутер', 'набор', 'вакансия', 'работа есть',
+            'vpn', 'proxy', 'прокси', 'обход блокиров',
+        ]
+        bio_lower = bio.lower()
+        for kw in spam_keywords:
+            if kw in bio_lower:
+                signals.append(f"Bio содержит '{kw}': «{bio[:100]}»")
+                break
+
+    # Проверяем привязанный личный канал
+    personal_chat = getattr(chat, 'personal_chat', None)
+    if personal_chat:
+        channel_title = getattr(personal_chat, 'title', '') or ''
+        channel_desc = ''
+        try:
+            channel_info = await bot.get_chat(personal_chat.id)
+            channel_desc = getattr(channel_info, 'description', '') or ''
+        except Exception:
+            pass
+
+        channel_text = f"{channel_title} {channel_desc}".lower()
+        channel_spam_keywords = [
+            'заработ', 'доход', 'ставк', 'букмекер', 'прогноз', 'сигнал',
+            'казино', 'крипт', 'трейдинг', 'trading', 'crypto', 'forex',
+            'кошельк', 'обмен', 'vpn', 'proxy', 'промокод', 'скидк',
+        ]
+        for kw in channel_spam_keywords:
+            if kw in channel_text:
+                signals.append(f"Личный канал «{channel_title}» содержит '{kw}': «{channel_desc[:100]}»")
+                break
+
+    return "; ".join(signals)
+
+
 # ──────────────────────────────────────────────
 # LLM: классификация (hardened)
 # ──────────────────────────────────────────────
@@ -351,6 +405,7 @@ async def check_message_with_llm(
     user_msg_count: int = 0,
     is_cas_banned: bool = False,
     photo_url: str = None,
+    profile_signal: str = "",
 ) -> tuple[SpamResult, str]:
     if user_id and not check_rate_limit(user_id):
         return SpamResult.MAYBE_SPAM, "Rate limit exceeded"
@@ -362,11 +417,22 @@ async def check_message_with_llm(
             logger.info(f"Vision → {result.value} (caption_len={len(message_text or '')}, msgs={user_msg_count})")
             return result, reasoning
 
+        # Если профиль подозрительный — добавляем в контекст для LLM
+        effective_text = message_text or ""
+        if profile_signal:
+            effective_text += f"\n\n[PROFILE CONTEXT: {profile_signal}]"
+
         # Текстовая классификация
         prompt_template = db.get_current_prompt()
         few_shot = build_few_shot_block()
-        result, reasoning = await classify_message(prompt_template, message_text, few_shot, user_msg_count, is_cas_banned)
-        logger.info(f"LLM → {result.value} (len={len(message_text)}, msgs={user_msg_count}, cas={is_cas_banned})")
+        result, reasoning = await classify_message(prompt_template, effective_text, few_shot, user_msg_count, is_cas_banned)
+        logger.info(f"LLM → {result.value} (len={len(message_text or '')}, msgs={user_msg_count}, cas={is_cas_banned}, profile={'yes' if profile_signal else 'no'})")
+
+        # Если профиль спамный, но LLM сказал НЕ_СПАМ → повышаем до MAYBE_SPAM
+        if profile_signal and result == SpamResult.NOT_SPAM:
+            result = SpamResult.MAYBE_SPAM
+            reasoning = f"Сообщение безобидное, но профиль подозрительный: {profile_signal}"
+
         return result, reasoning
     except Exception as e:
         logger.error(f"LLM error: {e}")
@@ -993,6 +1059,13 @@ async def handle_message(message: types.Message):
 
     is_cas_banned = await check_cas_ban(uid)
 
+    # Для новых пользователей — проверяем профиль (bio + личный канал)
+    profile_spam_signal = ""
+    if user_msg_count == 0:
+        profile_spam_signal = await check_user_profile(uid)
+        if profile_spam_signal:
+            logger.info(f"👤 Profile check @{username}: {profile_spam_signal[:100]}")
+
     # CAS + нет истории → автобан
     if is_cas_banned and user_msg_count == 0:
         logger.info(f"🚫 CAS-BAN @{username} (cas=True, msgs=0) | {message.chat.title} | «{text_preview}»")
@@ -1015,7 +1088,7 @@ async def handle_message(message: types.Message):
         except Exception as e:
             logger.error(f"Ошибка получения фото: {e}")
 
-    result, reasoning = await check_message_with_llm(msg_text, uid, user_msg_count, is_cas_banned, photo_url)
+    result, reasoning = await check_message_with_llm(msg_text, uid, user_msg_count, is_cas_banned, photo_url, profile_spam_signal)
     emoji = {"СПАМ": "🔴", "ВОЗМОЖНО_СПАМ": "🟡", "НЕ_СПАМ": "🟢"}[result.value]
     source = "Vision" if photo_url else "LLM"
     logger.info(f"{emoji} {source}→{result.value} @{username} (msgs={user_msg_count}, cas={is_cas_banned}) | {message.chat.title} | «{text_preview}» | reason: {reasoning[:100]}")
