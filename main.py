@@ -543,12 +543,16 @@ async def generate_improved_prompt(
                 {"role": "system", "content": "Ты помощник по улучшению промптов. Всегда отвечай строго в указанном формате с маркерами АНАЛИЗ: и ИТОГОВЫЙ_ПРОМПТ:"},
                 {"role": "user", "content": analysis_prompt},
             ],
-            **_token_limit_param_improvement(3000),
+            **_token_limit_param_improvement(8000),
             temperature=0.3,
-            timeout=60,
+            timeout=90,
         )
-        text = response.choices[0].message.content.strip()
-        logger.info(f"LLM improvement response length: {len(text)}, has marker: {'ИТОГОВЫЙ_ПРОМПТ:' in text}")
+        text = (response.choices[0].message.content or "").strip()
+        finish = response.choices[0].finish_reason
+        logger.info(f"LLM improvement: len={len(text)}, finish={finish}, has_marker={'ИТОГОВЫЙ_ПРОМПТ:' in text}")
+        if not text:
+            logger.warning("LLM вернул пустой ответ")
+            return None, None
 
         # Ищем маркер (с возможными вариациями форматирования)
         marker = None
