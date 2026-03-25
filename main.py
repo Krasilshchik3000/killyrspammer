@@ -543,7 +543,7 @@ async def generate_improved_prompt(
                 {"role": "system", "content": "Ты помощник по улучшению промптов. Всегда отвечай строго в указанном формате с маркерами АНАЛИЗ: и ИТОГОВЫЙ_ПРОМПТ:"},
                 {"role": "user", "content": analysis_prompt},
             ],
-            **_token_limit_param_improvement(8000),
+            **_token_limit_param_improvement(16000),
             temperature=0.3,
             timeout=90,
         )
