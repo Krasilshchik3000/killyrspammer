@@ -904,6 +904,7 @@ async def cmd_help(message: types.Message):
     await message.reply(
         "📚 <b>Команды</b>\n\n"
         "/stats — статистика\n"
+        "/improve — принудительное улучшение промпта\n"
         "/prompt — текущий промпт\n"
         "/history — история версий промпта\n"
         "/rollback N — откатить промпт к версии #N\n"
@@ -929,6 +930,14 @@ async def cmd_stats(message: types.Message):
         f"🔄 Ошибок до обновления промпта: {errors_since}/{AUTO_IMPROVE_AFTER_ERRORS}",
         parse_mode='HTML'
     )
+
+
+@dp.message(Command("improve"))
+@require_admin
+async def cmd_improve(message: types.Message):
+    """Принудительный запуск автоулучшения промпта."""
+    await message.reply("🔄 Запускаю улучшение промпта...")
+    asyncio.create_task(auto_improve_prompt("manual", "ручной запуск"))
 
 
 @dp.message(Command("prompt"))
