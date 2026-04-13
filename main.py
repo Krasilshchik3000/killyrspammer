@@ -183,57 +183,92 @@ async def check_cas_ban(user_id: int) -> bool:
 
 
 async def check_user_profile(user_id: int) -> str:
-    """Проверяет профиль пользователя на спам-сигналы.
+    """Проверяет профиль пользователя на спам-сигналы через raw Bot API.
+
+    Использует httpx напрямую (а не aiogram) чтобы получить поля
+    personal_chat и другие, которые aiogram 3.4.1 не поддерживает.
 
     Возвращает описание подозрительного контента или пустую строку.
     """
     try:
-        chat = await bot.get_chat(user_id)
+        response = await _http_client.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
+            params={"chat_id": user_id},
+            timeout=5,
+        )
+        data = response.json()
+        if not data.get("ok"):
+            return ""
+        chat = data["result"]
     except Exception:
         return ""
 
     signals = []
+    profile_parts = []  # Для LLM-анализа
 
-    # Проверяем bio
-    bio = getattr(chat, 'bio', '') or ''
+    # Bio
+    bio = chat.get("bio", "")
     if bio:
-        # Подозрительные паттерны в bio
-        spam_keywords = [
-            'заработ', 'доход', 'прибыл', 'инвестиц', 'крипт', 'казино',
-            'ставк', 'букмекер', 'прогноз', 'сигнал', 'трейдинг', 'trading',
-            'crypto', 'forex', 'p2p', 'обмен валют', 'пассивный доход',
-            'промоутер', 'набор', 'вакансия', 'работа есть',
-            'vpn', 'proxy', 'прокси', 'обход блокиров',
-        ]
-        bio_lower = bio.lower()
-        for kw in spam_keywords:
-            if kw in bio_lower:
-                signals.append(f"Bio содержит '{kw}': «{bio[:100]}»")
-                break
+        profile_parts.append(f"Bio: {bio}")
 
-    # Проверяем привязанный личный канал
-    personal_chat = getattr(chat, 'personal_chat', None)
+    # Привязанный личный канал (Bot API 7.2+)
+    personal_chat = chat.get("personal_chat")
     if personal_chat:
-        channel_title = getattr(personal_chat, 'title', '') or ''
-        channel_desc = ''
+        channel_title = personal_chat.get("title", "")
+        profile_parts.append(f"Личный канал: {channel_title}")
+
+        # Получаем описание канала
         try:
-            channel_info = await bot.get_chat(personal_chat.id)
-            channel_desc = getattr(channel_info, 'description', '') or ''
+            ch_resp = await _http_client.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
+                params={"chat_id": personal_chat["id"]},
+                timeout=5,
+            )
+            ch_data = ch_resp.json()
+            if ch_data.get("ok"):
+                ch_desc = ch_data["result"].get("description", "")
+                if ch_desc:
+                    profile_parts.append(f"Описание канала: {ch_desc}")
         except Exception:
             pass
 
-        channel_text = f"{channel_title} {channel_desc}".lower()
-        channel_spam_keywords = [
-            'заработ', 'доход', 'ставк', 'букмекер', 'прогноз', 'сигнал',
-            'казино', 'крипт', 'трейдинг', 'trading', 'crypto', 'forex',
-            'кошельк', 'обмен', 'vpn', 'proxy', 'промокод', 'скидк',
-        ]
-        for kw in channel_spam_keywords:
-            if kw in channel_text:
-                signals.append(f"Личный канал «{channel_title}» содержит '{kw}': «{channel_desc[:100]}»")
-                break
+    if not profile_parts:
+        return ""
 
-    return "; ".join(signals)
+    # Быстрая keyword-проверка (дешёвая, без LLM)
+    profile_text = " ".join(profile_parts).lower()
+    spam_keywords = [
+        'заработ', 'доход', 'прибыл', 'инвестиц', 'крипт', 'казино',
+        'ставк', 'букмекер', 'прогноз', 'сигнал', 'трейдинг', 'trading',
+        'crypto', 'forex', 'p2p', 'обмен валют', 'пассивный доход',
+        'промоутер', 'набор', 'вакансия', 'работа есть',
+        'vpn', 'proxy', 'прокси', 'обход блокиров', 'кошельк',
+        'betting', 'bet', 'casino', 'earn', 'income', 'profit',
+    ]
+    for kw in spam_keywords:
+        if kw in profile_text:
+            return f"Профиль: {'; '.join(profile_parts[:3])}"
+
+    # Если keywords не сработали, но есть личный канал — проверяем через LLM
+    if personal_chat and len(profile_parts) >= 2:
+        try:
+            resp = await openai_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": "Ты проверяешь профили пользователей Telegram на спам. Ответь YES если профиль похож на спам/скам (реклама, букмекеры, крипта, мошенничество, продажа), иначе NO. Отвечай одним словом."},
+                    {"role": "user", "content": "\n".join(profile_parts)},
+                ],
+                **_token_limit_param(10),
+                temperature=0,
+                timeout=10,
+            )
+            answer = resp.choices[0].message.content.strip().upper()
+            if "YES" in answer:
+                return f"Профиль (LLM): {'; '.join(profile_parts[:3])}"
+        except Exception as e:
+            logger.warning(f"Profile LLM check failed: {e}")
+
+    return ""
 
 
 # ──────────────────────────────────────────────
@@ -1074,10 +1109,24 @@ async def handle_message(message: types.Message):
 
     # Для новых пользователей — проверяем профиль (bio + личный канал)
     profile_spam_signal = ""
-    if user_msg_count == 0:
+    if user_msg_count <= 2:
         profile_spam_signal = await check_user_profile(uid)
         if profile_spam_signal:
             logger.info(f"👤 Profile check @{username}: {profile_spam_signal[:100]}")
+
+    # Пересланное сообщение от нового пользователя — повышенная подозрительность
+    is_forward = bool(message.forward_date)
+    if is_forward and user_msg_count <= 2:
+        forward_source = ""
+        if message.forward_from_chat:
+            forward_source = f"Переслано из канала «{message.forward_from_chat.title}»"
+        elif message.forward_from:
+            forward_source = f"Переслано от {message.forward_from.full_name}"
+        elif message.forward_sender_name:
+            forward_source = f"Переслано от {message.forward_sender_name}"
+        if forward_source:
+            profile_spam_signal = f"{profile_spam_signal}; {forward_source}" if profile_spam_signal else forward_source
+            logger.info(f"📨 Forward from new user @{username}: {forward_source}")
 
     # CAS + нет истории → автобан
     if is_cas_banned and user_msg_count == 0:
