@@ -1093,7 +1093,9 @@ async def handle_message(message: types.Message):
     user_msg_count = db.count_user_messages(uid, cid)
 
     # Пользователь с историей сообщений — доверенный, не проверяем через LLM
-    if user_msg_count >= TRUSTED_USER_MESSAGES:
+    # ИСКЛЮЧЕНИЕ: пересланные сообщения всегда проверяются (VPN-спам паттерн)
+    is_forward = bool(message.forward_date)
+    if user_msg_count >= TRUSTED_USER_MESSAGES and not is_forward:
         logger.info(f"✅ TRUSTED @{username} (msgs={user_msg_count}) | {message.chat.title} | «{text_preview}»")
         try:
             db.save_message(message.message_id, cid, uid, message.from_user.username or '', msg_text, "НЕ_СПАМ")
@@ -1114,9 +1116,8 @@ async def handle_message(message: types.Message):
         if profile_spam_signal:
             logger.info(f"👤 Profile check @{username}: {profile_spam_signal[:100]}")
 
-    # Пересланное сообщение от нового пользователя — повышенная подозрительность
-    is_forward = bool(message.forward_date)
-    if is_forward and user_msg_count <= 2:
+    # Пересланное сообщение — повышенная подозрительность
+    if is_forward:
         forward_source = ""
         if message.forward_from_chat:
             forward_source = f"Переслано из канала «{message.forward_from_chat.title}»"
