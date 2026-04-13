@@ -1291,6 +1291,7 @@ async def main():
         BotCommand(command="start", description="Информация о боте"),
         BotCommand(command="help", description="Справка"),
         BotCommand(command="stats", description="Статистика (админ)"),
+        BotCommand(command="improve", description="Улучшить промпт (админ)"),
         BotCommand(command="prompt", description="Текущий промпт (админ)"),
         BotCommand(command="history", description="История промптов (админ)"),
         BotCommand(command="rollback", description="Откат промпта (админ)"),
