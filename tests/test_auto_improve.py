@@ -106,7 +106,7 @@ class TestEvaluatePrompt:
 
         with patch('main.classify_message', side_effect=mock_classify):
             examples = [("spam_1", True), ("spam_2", True), ("ham_1", False), ("ham_2", False)]
-            accuracy, correct, total = await evaluate_prompt("test prompt", examples)
+            accuracy, correct, total, errors = await evaluate_prompt("test prompt", examples)
             assert accuracy == 1.0
             assert correct == 4
             assert total == 4
@@ -128,13 +128,13 @@ class TestEvaluatePrompt:
 
         with patch('main.classify_message', side_effect=mock_classify):
             examples = [("spam_1", True), ("ham_1", False), ("spam_2", True), ("spam_3", True)]
-            accuracy, correct, total = await evaluate_prompt("test", examples)
+            accuracy, correct, total, errors = await evaluate_prompt("test", examples)
             assert accuracy == 0.5
             assert correct == 2
 
     async def test_empty_examples(self):
         from main import evaluate_prompt
-        accuracy, correct, total = await evaluate_prompt("test", [])
+        accuracy, correct, total, errors = await evaluate_prompt("test", [])
         assert accuracy == 0.0
         assert total == 0
 
@@ -173,8 +173,8 @@ class TestAutoImprovePrompt:
 
         with patch.object(main, 'generate_improved_prompt', return_value=("Анализ", "improved {message_text} СПАМ НЕ_СПАМ ВОЗМОЖНО_СПАМ")), \
              patch.object(main, 'evaluate_prompt', side_effect=[
-                 (0.7, 7, 10),  # текущий: 70%
-                 (0.9, 9, 10),  # новый: 90%
+                 (0.7, 7, 10, []),  # текущий: 70%
+                 (0.9, 9, 10, []),  # новый: 90%
              ]), \
              patch.object(main, 'bot') as mock_bot, \
              patch.object(main, 'db') as mock_db:
@@ -198,8 +198,8 @@ class TestAutoImprovePrompt:
 
         with patch.object(main, 'generate_improved_prompt', return_value=("Анализ", "worse {message_text} СПАМ НЕ_СПАМ ВОЗМОЖНО_СПАМ")), \
              patch.object(main, 'evaluate_prompt', side_effect=[
-                 (0.9, 9, 10),  # текущий: 90%
-                 (0.6, 6, 10),  # новый: 60% — хуже!
+                 (0.9, 9, 10, []),  # текущий: 90%
+                 (0.6, 6, 10, []),  # новый: 60% — хуже!
              ]), \
              patch.object(main, 'bot') as mock_bot, \
              patch.object(main, 'db') as mock_db:

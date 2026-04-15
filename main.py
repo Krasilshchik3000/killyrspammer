@@ -478,16 +478,18 @@ async def check_message_with_llm(
 # Автоматическое улучшение промпта
 # ──────────────────────────────────────────────
 
-async def evaluate_prompt(prompt_template: str, examples: list) -> tuple[float, int, int]:
-    """Оценить промпт на примерах. Возвращает (accuracy, correct, total).
+async def evaluate_prompt(prompt_template: str, examples: list) -> tuple[float, int, int, list]:
+    """Оценить промпт на примерах. Возвращает (accuracy, correct, total, errors).
 
     examples: [(text, is_spam), ...]
+    errors: [(text, expected, got), ...] — конкретные ошибочные примеры
     """
     if not examples:
-        return 0.0, 0, 0
+        return 0.0, 0, 0, []
 
     correct = 0
     total = len(examples)
+    errors = []
 
     for text, is_spam in examples:
         try:
@@ -497,21 +499,27 @@ async def evaluate_prompt(prompt_template: str, examples: list) -> tuple[float, 
             actual_spam = bool(is_spam)
             if predicted_spam == actual_spam:
                 correct += 1
+            else:
+                expected = "SPAM" if actual_spam else "NOT_SPAM"
+                got = "SPAM" if predicted_spam else "NOT_SPAM"
+                errors.append((text[:120], expected, got))
         except Exception as e:
             logger.warning(f"Ошибка валидации примера: {e}")
-            total -= 1  # Не считаем ошибочные
+            total -= 1
 
     accuracy = correct / total if total > 0 else 0.0
-    return accuracy, correct, total
+    return accuracy, correct, total, errors
 
 
 async def generate_improved_prompt(
     error_type: str, message_text: str,
-    failed_attempts: list[tuple[str, float | None]] | None = None
+    failed_attempts: list[tuple[str, float | None]] | None = None,
+    validation_errors: list[tuple[str, str, str]] | None = None,
 ) -> tuple[str, str] | tuple[None, None]:
     """Генерирует улучшенный промпт. Возвращает (analysis, improved_prompt) или (None, None).
 
     failed_attempts: список предыдущих неудачных попыток [(analysis, accuracy), ...]
+    validation_errors: конкретные ошибки текущего промпта [(text, expected, got), ...]
     """
     current_prompt = db.get_current_prompt()
 
@@ -541,6 +549,14 @@ async def generate_improved_prompt(
         lines.append("Каждая новая попытка ДОЛЖНА использовать существенно другой подход.")
         failed_block = "\n".join(lines)
 
+    # Блок конкретных ошибок текущего промпта на валидации
+    validation_errors_block = ""
+    if validation_errors:
+        lines = ["КОНКРЕТНЫЕ ОШИБКИ ТЕКУЩЕГО ПРОМПТА НА ВАЛИДАЦИИ:"]
+        for text, expected, got in validation_errors[:10]:
+            lines.append(f"  - «{text}» — ожидалось: {expected}, бот сказал: {got}")
+        validation_errors_block = "\n".join(lines)
+
     analysis_prompt = f"""Ты эксперт по созданию промптов для определения спама в Telegram-группах.
 
 ТЕКУЩИЙ ПРОМПТ (используется для классификации сообщений):
@@ -550,6 +566,8 @@ async def generate_improved_prompt(
 
 ОШИБКА КЛАССИФИКАЦИИ: {description}
 Проблемное сообщение: "{message_text}"
+
+{validation_errors_block}
 
 {mistakes_block}
 
@@ -650,13 +668,13 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
 
         # Оцениваем текущий промпт один раз (для всех попыток)
         current_prompt = db.get_current_prompt()
-        current_acc, current_ok, current_total = 0.0, 0, 0
+        current_acc, current_ok, current_total, current_errors = 0.0, 0, 0, []
         validation_examples = []
 
         if has_enough_for_validation:
             validation_examples = db.get_validation_examples(MAX_VALIDATION_EXAMPLES)
-            current_acc, current_ok, current_total = await evaluate_prompt(current_prompt, validation_examples)
-            logger.info(f"Текущая точность: {current_acc:.0%} ({current_ok}/{current_total})")
+            current_acc, current_ok, current_total, current_errors = await evaluate_prompt(current_prompt, validation_examples)
+            logger.info(f"Текущая точность: {current_acc:.0%} ({current_ok}/{current_total}), ошибок: {len(current_errors)}")
 
         # Цикл попыток улучшения
         failed_attempts = []  # [(analysis, accuracy), ...]
@@ -664,9 +682,9 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
         for attempt in range(1, MAX_IMPROVEMENT_ATTEMPTS + 1):
             logger.info(f"Попытка улучшения {attempt}/{MAX_IMPROVEMENT_ATTEMPTS}")
 
-            # Генерируем с контекстом предыдущих неудач
+            # Генерируем с контекстом предыдущих неудач и конкретных ошибок
             analysis, improved = await generate_improved_prompt(
-                trigger_error_type, trigger_message, failed_attempts
+                trigger_error_type, trigger_message, failed_attempts, current_errors
             )
             if not improved:
                 detail = f"\nАнализ LLM: {analysis[:300]}" if analysis else "\nLLM не вернул ответ"
@@ -692,7 +710,7 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
                 return
 
             # Валидация
-            new_acc, new_ok, new_total = await evaluate_prompt(improved, validation_examples)
+            new_acc, new_ok, new_total, _ = await evaluate_prompt(improved, validation_examples)
             logger.info(f"Попытка {attempt}: {new_acc:.0%} ({new_ok}/{new_total}) vs текущий {current_acc:.0%}")
 
             if new_acc > current_acc:
@@ -714,18 +732,17 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
             failed_attempts.append((analysis, new_acc))
             logger.info(f"Попытка {attempt}: не лучше ({new_acc:.0%} <= {current_acc:.0%}), продолжаем...")
 
-        # Все попытки исчерпаны
-        attempts_log = "\n".join(
-            f"  #{i+1}: {acc:.0%} — {reason[:80]}" if acc is not None else f"  #{i+1}: ❌ — {reason[:80]}"
-            for i, (reason, acc) in enumerate(failed_attempts)
-        )
+        # Все попытки исчерпаны — короткий отчёт
+        best_attempt_acc = max((acc for _, acc in failed_attempts if acc is not None), default=0)
+        errors_summary = ""
+        if current_errors:
+            error_examples = [f"«{t[:60]}»" for t, _, _ in current_errors[:3]]
+            errors_summary = f"\nОшибается на: {', '.join(error_examples)}"
         report = (
-            f"🔄 <b>Промпт НЕ обновлён ({MAX_IMPROVEMENT_ATTEMPTS} попыток)</b>\n\n"
-            f"Текущий: {current_acc:.0%} ({current_ok}/{current_total})\n\n"
-            f"Попытки:\n<code>{html.escape(attempts_log)}</code>\n\n"
-            f"Few-shot примеры продолжают учитывать исправления."
+            f"🔄 Промпт не улучшен (5 попыток, лучшая: {best_attempt_acc:.0%} vs текущая: {current_acc:.0%}). "
+            f"Few-shot примеры учтены.{errors_summary}"
         )
-        await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
+        await bot.send_message(ADMIN_ID, report)
 
     except Exception as e:
         logger.error(f"Ошибка автоулучшения: {e}")
