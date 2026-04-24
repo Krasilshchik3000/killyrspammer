@@ -250,20 +250,8 @@ def init_database():
             (DEFAULT_PROMPT, 'Начальный промпт', datetime.now())
         )
 
-    # Проверяем, не устарел ли текущий промпт
-    cursor.execute("SELECT prompt_text FROM prompt_versions ORDER BY id DESC LIMIT 1")
-    current_row = cursor.fetchone()
-    if current_row and current_row[0]:
-        current_text = current_row[0]
-        # Признаки нового промпта v3: содержит "БЕЗОПАСНОСТЬ" И "<message>"
-        has_new_markers = "БЕЗОПАСНОСТЬ" in current_text and "<message>" in current_text
-        if not has_new_markers:
-            placeholder = '%s' if DATABASE_URL else '?'
-            cursor.execute(
-                f"INSERT INTO prompt_versions (prompt_text, reason, created_at) VALUES ({placeholder}, {placeholder}, {placeholder})",
-                (DEFAULT_PROMPT, 'Автообновление: улучшенный промпт v2', datetime.now())
-            )
-            logger.info("Обновлён устаревший промпт на новую версию")
+    # Миграция v3 промпта удалена — перезаписывала авто-улучшенные промпты при каждом деплое.
+    # Для сброса промпта используйте /resetprompt.
 
     # Миграция: добавить колонку reasoning если её нет
     try:
