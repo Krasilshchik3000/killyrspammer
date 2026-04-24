@@ -884,22 +884,37 @@ async def run_full_audit():
         )
         text = (response.choices[0].message.content or "").strip()
 
-        # Парсим результат
+        # ── Часть 1: Отчёт о текущем состоянии ──
+        fp_list = "\n".join(f"  • «{html.escape(t)}»" for t, _ in false_positives[:10]) or "  (нет)"
+        ms_list = "\n".join(f"  • «{html.escape(t)}»" for t, _ in missed_spam[:10]) or "  (нет)"
+
+        report1 = (
+            f"🔍 <b>АУДИТ: Часть 1 — Текущее состояние</b>\n\n"
+            f"📊 <b>Статистика:</b>\n"
+            f"  Решений админа: {stats['total_decisions']}\n"
+            f"  Training examples: {stats['total_examples']}\n"
+            f"  Забанено за 7 дней: {stats['banned_profiles']}\n"
+            f"  Точность бота: {accuracy:.0%} ({correct}/{len(all_decisions)})\n\n"
+            f"❌ <b>Ложные срабатывания ({len(false_positives)}):</b>\n{fp_list}\n\n"
+            f"⚠️ <b>Пропущенный спам ({len(missed_spam)}):</b>\n{ms_list}"
+        )
+        if wave_analysis:
+            report1 += f"\n\n🌊 <b>Спам-волны:</b>\n{html.escape(wave_analysis[:400])}"
+
+        await bot.send_message(ADMIN_ID, report1, parse_mode='HTML')
+
+        # ── Генерация нового промпта ──
+        # Парсим результат LLM
         if "ИТОГОВЫЙ_ПРОМПТ:" not in text:
-            analysis = text[:500] if text else "LLM не вернул ответ"
-            report = (
-                f"🔍 <b>Аудит завершён</b>\n\n"
-                f"Точность: {accuracy:.0%} ({correct}/{len(all_decisions)})\n"
-                f"Ложные +: {len(false_positives)} | Пропущено: {len(missed_spam)}\n\n"
-                f"Анализ: {html.escape(analysis[:500])}\n\n"
-                f"⚠️ Новый промпт не сгенерирован"
-            )
-            await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
+            analysis = text[:800] if text else "LLM не вернул ответ"
+            await bot.send_message(ADMIN_ID,
+                f"⚠️ <b>Новый промпт не сгенерирован</b>\n\nАнализ:\n{html.escape(analysis[:800])}",
+                parse_mode='HTML')
             return
 
-        parts = text.split("ИТОГОВЫЙ_ПРОМПТ:", 1)
-        analysis = parts[0].replace("АНАЛИЗ:", "").strip()
-        new_prompt = parts[1].strip()
+        parts_split = text.split("ИТОГОВЫЙ_ПРОМПТ:", 1)
+        analysis = parts_split[0].replace("АНАЛИЗ:", "").strip()
+        new_prompt = parts_split[1].strip()
 
         # Валидация
         problems = validate_prompt(new_prompt)
@@ -907,41 +922,81 @@ async def run_full_audit():
             await bot.send_message(ADMIN_ID, f"⚠️ Аудит: новый промпт невалиден: {', '.join(problems)}")
             return
 
-        # Оцениваем на всех примерах
-        all_eval = [(t, s) for t, s, _, _ in all_examples]
-        if len(all_eval) >= 10:
-            current_acc, current_ok, current_total, _ = await evaluate_prompt(current_prompt, all_eval[:50])
-            new_acc, new_ok, new_total, _ = await evaluate_prompt(new_prompt, all_eval[:50])
+        # ── Часть 2: Анализ проблем ──
+        report2 = (
+            f"🔍 <b>АУДИТ: Часть 2 — Анализ</b>\n\n"
+            f"{html.escape(analysis[:3800])}"
+        )
+        await bot.send_message(ADMIN_ID, report2, parse_mode='HTML')
 
+        # ── Часть 3: Валидация нового промпта ──
+        all_eval = [(t, s) for t, s, _, _ in all_examples]
+        applied = False
+
+        if len(all_eval) >= 10:
+            eval_set = all_eval[:50]
+            current_acc, current_ok, current_total, current_errors = await evaluate_prompt(current_prompt, eval_set)
+            new_acc, new_ok, new_total, new_errors = await evaluate_prompt(new_prompt, eval_set)
+
+            # Детальное сравнение: что исправлено, что сломалось
+            # Прогоняем оба промпта на тех же примерах и сравниваем
+            fixed = []  # ошибки старого, которые новый исправил
+            broken = []  # правильные старого, которые новый сломал
+
+            for err_text, err_expected, err_got in current_errors:
+                # Эта ошибка есть у старого — проверяем, исправил ли новый
+                if not any(e[0] == err_text for e in new_errors):
+                    fixed.append(f"✅ «{err_text[:60]}» ({err_expected})")
+
+            for err_text, err_expected, err_got in new_errors:
+                # Эта ошибка есть у нового но не было у старого
+                if not any(e[0] == err_text for e in current_errors):
+                    broken.append(f"🔴 «{err_text[:60]}» ({err_expected}→{err_got})")
+
+            fixed_block = "\n".join(fixed[:10]) or "  (ничего нового не исправлено)"
+            broken_block = "\n".join(broken[:10]) or "  (ничего не сломано)"
+            remaining_block = "\n".join(
+                f"  • «{t[:60]}» ({e}→{g})" for t, e, g in new_errors[:10]
+            ) or "  (нет ошибок)"
+
+            verdict = "✅ ПРИМЕНЁН" if new_acc > current_acc else "❌ НЕ ПРИМЕНЁН (не лучше)"
             if new_acc > current_acc:
                 db.save_prompt_version(new_prompt, f"Аудит: {new_acc:.0%} vs {current_acc:.0%}")
-                report = (
-                    f"✅ <b>Аудит: промпт обновлён</b>\n\n"
-                    f"Было: {current_acc:.0%} ({current_ok}/{current_total})\n"
-                    f"Стало: {new_acc:.0%} ({new_ok}/{new_total})\n\n"
-                    f"Анализ: {html.escape(analysis[:400])}\n\n"
-                    f"Откатить: /rollback (из /history)"
-                )
-            else:
-                report = (
-                    f"🔍 <b>Аудит завершён, промпт не обновлён</b>\n\n"
-                    f"Текущий: {current_acc:.0%} | Новый: {new_acc:.0%}\n\n"
-                    f"Анализ: {html.escape(analysis[:400])}"
-                )
+                applied = True
+
+            report3 = (
+                f"🔍 <b>АУДИТ: Часть 3 — Валидация</b>\n\n"
+                f"📈 <b>Точность:</b> {current_acc:.0%} → {new_acc:.0%} ({current_ok}/{current_total} → {new_ok}/{new_total})\n"
+                f"<b>Вердикт:</b> {verdict}\n\n"
+                f"<b>Исправлено новым промптом:</b>\n{fixed_block}\n\n"
+                f"<b>Новые ошибки (регрессии):</b>\n{broken_block}\n\n"
+                f"<b>Оставшиеся ошибки:</b>\n{remaining_block}"
+            )
+            if applied:
+                report3 += "\n\nОткатить: /rollback (из /history)"
         else:
-            # Мало данных — применяем
             db.save_prompt_version(new_prompt, "Аудит (без валидации)")
-            report = (
-                f"✅ <b>Аудит: промпт обновлён</b> (мало данных для валидации)\n\n"
-                f"Анализ: {html.escape(analysis[:400])}\n\n"
+            applied = True
+            report3 = (
+                f"🔍 <b>АУДИТ: Часть 3 — Валидация</b>\n\n"
+                f"⚠️ Мало данных для валидации ({len(all_eval)} примеров). Промпт применён.\n"
                 f"Откатить: /rollback (из /history)"
             )
 
-        # Добавляем wave analysis если есть
-        if wave_analysis:
-            report += f"\n\n🌊 <b>Спам-волны:</b>\n{html.escape(wave_analysis[:300])}"
+        await bot.send_message(ADMIN_ID, report3, parse_mode='HTML')
 
-        await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
+        # ── Часть 4: Текущий промпт (полный текст) ──
+        active_prompt = new_prompt if applied else current_prompt
+        prompt_escaped = html.escape(active_prompt)
+        # Разбиваем на чанки по 3800 символов (лимит Telegram 4096 - разметка)
+        label = "📝 <b>АУДИТ: Часть 4 — Текущий промпт</b>\n\n"
+        if len(prompt_escaped) <= 3700:
+            await bot.send_message(ADMIN_ID, f"{label}<code>{prompt_escaped}</code>", parse_mode='HTML')
+        else:
+            chunks = [prompt_escaped[i:i+3700] for i in range(0, len(prompt_escaped), 3700)]
+            for i, chunk in enumerate(chunks):
+                header = label if i == 0 else f"📝 <b>Промпт (часть {i+1}):</b>\n\n"
+                await bot.send_message(ADMIN_ID, f"{header}<code>{chunk}</code>", parse_mode='HTML')
 
     except Exception as e:
         logger.error(f"Ошибка аудита: {e}", exc_info=True)
@@ -1269,10 +1324,14 @@ async def cmd_audit(message: types.Message):
 async def cmd_prompt(message: types.Message):
     current = db.get_current_prompt()
     escaped = html.escape(current)
-    # Telegram limit 4096 chars
-    if len(escaped) > 3900:
-        escaped = escaped[:3900] + "\n\n... (обрезан)"
-    await message.reply(f"📝 <b>Текущий промпт:</b>\n\n<code>{escaped}</code>", parse_mode='HTML')
+    # Разбиваем на чанки если не влезает
+    if len(escaped) <= 3700:
+        await message.reply(f"📝 <b>Текущий промпт:</b>\n\n<code>{escaped}</code>", parse_mode='HTML')
+    else:
+        chunks = [escaped[i:i+3700] for i in range(0, len(escaped), 3700)]
+        for i, chunk in enumerate(chunks):
+            header = "📝 <b>Текущий промпт:</b>\n\n" if i == 0 else f"📝 <b>Промпт (часть {i+1}/{len(chunks)}):</b>\n\n"
+            await message.reply(f"{header}<code>{chunk}</code>", parse_mode='HTML')
 
 
 @dp.message(Command("history"))
