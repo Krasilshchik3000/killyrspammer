@@ -101,6 +101,21 @@ CREATE TABLE IF NOT EXISTS bot_state (
     pending_prompt TEXT,
     updated_at TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS banned_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    username TEXT,
+    full_name TEXT,
+    bio TEXT,
+    channel_title TEXT,
+    channel_description TEXT,
+    message_text TEXT,
+    ban_reason TEXT,
+    banned_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_banned_profiles_time ON banned_profiles (banned_at);
 """
 
 _SCHEMA_POSTGRES = """
@@ -143,6 +158,21 @@ CREATE TABLE IF NOT EXISTS bot_state (
     pending_prompt TEXT,
     updated_at TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS banned_profiles (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT,
+    username TEXT,
+    full_name TEXT,
+    bio TEXT,
+    channel_title TEXT,
+    channel_description TEXT,
+    message_text TEXT,
+    ban_reason TEXT,
+    banned_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_banned_profiles_time ON banned_profiles (banned_at);
 """
 
 DEFAULT_PROMPT = """Ты антиспам-классификатор для русскоязычных Telegram-групп.
@@ -473,3 +503,59 @@ def get_bot_state(admin_id):
     if row:
         return row[0], row[1]
     return False, None
+
+
+# ──────────────────────────────────────────────
+# Профили забаненных (для детектора спам-волн)
+# ──────────────────────────────────────────────
+
+def save_banned_profile(user_id, username, full_name, bio, channel_title,
+                        channel_description, message_text, ban_reason):
+    execute_query(
+        """INSERT INTO banned_profiles
+           (user_id, username, full_name, bio, channel_title, channel_description,
+            message_text, ban_reason, banned_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, username, full_name, bio, channel_title, channel_description,
+         message_text, ban_reason, datetime.now())
+    )
+
+
+def get_recent_banned_profiles(hours=168):
+    """Получить профили забаненных за последние N часов (по умолчанию 7 дней)."""
+    if DATABASE_URL:
+        return execute_query(
+            "SELECT user_id, username, full_name, bio, channel_title, channel_description, "
+            "message_text, ban_reason, banned_at FROM banned_profiles "
+            "WHERE banned_at > NOW() - INTERVAL '1 hour' * ? ORDER BY banned_at DESC",
+            (hours,), fetch='all'
+        ) or []
+    else:
+        return execute_query(
+            "SELECT user_id, username, full_name, bio, channel_title, channel_description, "
+            "message_text, ban_reason, banned_at FROM banned_profiles "
+            f"WHERE banned_at > datetime('now', '-{int(hours)} hours') ORDER BY banned_at DESC",
+            fetch='all'
+        ) or []
+
+
+# ──────────────────────────────────────────────
+# Аудит: полный анализ всех данных
+# ──────────────────────────────────────────────
+
+def get_all_admin_decisions(limit=500):
+    """Все сообщения с решениями админа (для полного аудита)."""
+    return execute_query(
+        """SELECT text, llm_result, admin_decision, reasoning, created_at
+           FROM messages WHERE admin_decision IS NOT NULL
+           ORDER BY admin_decided_at DESC LIMIT ?""",
+        (limit,), fetch='all'
+    ) or []
+
+
+def get_all_training_examples():
+    """Все training examples (для полного аудита)."""
+    return execute_query(
+        "SELECT text, is_spam, source, created_at FROM training_examples ORDER BY id",
+        fetch='all'
+    ) or []

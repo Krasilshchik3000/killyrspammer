@@ -271,6 +271,36 @@ async def check_user_profile(user_id: int) -> str:
     return ""
 
 
+async def _get_profile_data(user_id: int) -> dict:
+    """Получить bio и канал пользователя через raw Bot API."""
+    try:
+        response = await _http_client.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
+            params={"chat_id": user_id}, timeout=5,
+        )
+        data = response.json()
+        if not data.get("ok"):
+            return {}
+        chat = data["result"]
+        result = {"bio": chat.get("bio", "")}
+        personal_chat = chat.get("personal_chat")
+        if personal_chat:
+            result["channel_title"] = personal_chat.get("title", "")
+            try:
+                ch_resp = await _http_client.get(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
+                    params={"chat_id": personal_chat["id"]}, timeout=5,
+                )
+                ch_data = ch_resp.json()
+                if ch_data.get("ok"):
+                    result["channel_desc"] = ch_data["result"].get("description", "")
+            except Exception:
+                pass
+        return result
+    except Exception:
+        return {}
+
+
 # ──────────────────────────────────────────────
 # LLM: классификация (hardened)
 # ──────────────────────────────────────────────
@@ -764,6 +794,227 @@ async def maybe_trigger_improvement(error_type: str, message_text: str):
 # ──────────────────────────────────────────────
 # Telegram: проверки и действия
 # ──────────────────────────────────────────────
+# Полный аудит промпта + детектор спам-волн
+# ──────────────────────────────────────────────
+
+async def run_full_audit():
+    """Полный аудит: анализ всех данных, поиск паттернов, улучшение промпта."""
+    try:
+        await bot.send_message(ADMIN_ID, "🔍 Начинаю полный аудит промпта...")
+
+        # 1. Собираем все данные
+        all_decisions = db.get_all_admin_decisions(500)
+        all_examples = db.get_all_training_examples()
+        current_prompt = db.get_current_prompt()
+        banned_profiles = db.get_recent_banned_profiles(168)  # 7 дней
+
+        # 2. Формируем статистику
+        stats = {
+            "total_decisions": len(all_decisions),
+            "total_examples": len(all_examples),
+            "banned_profiles": len(banned_profiles),
+        }
+
+        # Считаем ошибки по типам
+        false_positives = []  # бот сказал спам, админ — нет
+        missed_spam = []  # бот сказал не спам, админ — спам
+        correct = 0
+        for text, llm_result, admin_decision, reasoning, _ in all_decisions:
+            llm_spam = llm_result in ('СПАМ', 'ВОЗМОЖНО_СПАМ')
+            admin_spam = admin_decision == 'СПАМ'
+            if llm_spam == admin_spam:
+                correct += 1
+            elif llm_spam and not admin_spam:
+                false_positives.append((text[:100], reasoning or ''))
+            elif not llm_spam and admin_spam:
+                missed_spam.append((text[:100], reasoning or ''))
+
+        accuracy = correct / len(all_decisions) if all_decisions else 0
+
+        # 3. Анализ спам-волн
+        wave_analysis = await detect_spam_waves(banned_profiles)
+
+        # 4. Отправляем всё в LLM для глубокого анализа и генерации нового промпта
+        fp_block = "\n".join(f"  - «{t}» (бот думал: {r[:60]})" for t, r in false_positives[:15])
+        ms_block = "\n".join(f"  - «{t}» (бот думал: {r[:60]})" for t, r in missed_spam[:15])
+
+        audit_prompt = f"""Ты эксперт по антиспам-системам в Telegram. Проведи полный аудит промпта.
+
+ТЕКУЩИЙ ПРОМПТ:
+---
+{current_prompt}
+---
+
+СТАТИСТИКА:
+- Всего решений админа: {stats['total_decisions']}
+- Точность бота: {accuracy:.0%} ({correct}/{len(all_decisions)})
+- Ложные срабатывания (бот думал спам, а это не спам): {len(false_positives)}
+- Пропущенный спам (бот думал не спам, а это спам): {len(missed_spam)}
+- Забаненных за 7 дней: {stats['banned_profiles']}
+
+ЛОЖНЫЕ СРАБАТЫВАНИЯ:
+{fp_block or '  (нет)'}
+
+ПРОПУЩЕННЫЙ СПАМ:
+{ms_block or '  (нет)'}
+
+ОБНАРУЖЕННЫЕ ПАТТЕРНЫ СПАМ-ВОЛН:
+{wave_analysis or '  (нет данных)'}
+
+ЗАДАЧА:
+1. Проанализируй паттерны ошибок — что общего у ложных срабатываний? Что общего у пропущенного спама?
+2. Найди системные проблемы в промпте
+3. Напиши ПОЛНОСТЬЮ НОВЫЙ промпт, который устраняет найденные проблемы
+4. Промпт ОБЯЗАН содержать {{{{few_shot_block}}}} и три категории: SPAM, NOT_SPAM, MAYBE_SPAM
+5. Промпт используется как system prompt, сообщение приходит в теге <message>
+
+Ответь в формате:
+АНАЛИЗ: подробный анализ (5-10 предложений)
+ИТОГОВЫЙ_ПРОМПТ: полный новый промпт"""
+
+        response = await openai_client.chat.completions.create(
+            model=LLM_IMPROVEMENT_MODEL,
+            messages=[
+                {"role": "system", "content": "Ты эксперт по антиспам-системам. Проводишь полный аудит."},
+                {"role": "user", "content": audit_prompt},
+            ],
+            **_token_limit_param_improvement(16000),
+            temperature=0.3,
+            timeout=120,
+        )
+        text = (response.choices[0].message.content or "").strip()
+
+        # Парсим результат
+        if "ИТОГОВЫЙ_ПРОМПТ:" not in text:
+            analysis = text[:500] if text else "LLM не вернул ответ"
+            report = (
+                f"🔍 <b>Аудит завершён</b>\n\n"
+                f"Точность: {accuracy:.0%} ({correct}/{len(all_decisions)})\n"
+                f"Ложные +: {len(false_positives)} | Пропущено: {len(missed_spam)}\n\n"
+                f"Анализ: {html.escape(analysis[:500])}\n\n"
+                f"⚠️ Новый промпт не сгенерирован"
+            )
+            await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
+            return
+
+        parts = text.split("ИТОГОВЫЙ_ПРОМПТ:", 1)
+        analysis = parts[0].replace("АНАЛИЗ:", "").strip()
+        new_prompt = parts[1].strip()
+
+        # Валидация
+        problems = validate_prompt(new_prompt)
+        if problems:
+            await bot.send_message(ADMIN_ID, f"⚠️ Аудит: новый промпт невалиден: {', '.join(problems)}")
+            return
+
+        # Оцениваем на всех примерах
+        all_eval = [(t, s) for t, s, _, _ in all_examples]
+        if len(all_eval) >= 10:
+            current_acc, current_ok, current_total, _ = await evaluate_prompt(current_prompt, all_eval[:50])
+            new_acc, new_ok, new_total, _ = await evaluate_prompt(new_prompt, all_eval[:50])
+
+            if new_acc > current_acc:
+                db.save_prompt_version(new_prompt, f"Аудит: {new_acc:.0%} vs {current_acc:.0%}")
+                report = (
+                    f"✅ <b>Аудит: промпт обновлён</b>\n\n"
+                    f"Было: {current_acc:.0%} ({current_ok}/{current_total})\n"
+                    f"Стало: {new_acc:.0%} ({new_ok}/{new_total})\n\n"
+                    f"Анализ: {html.escape(analysis[:400])}\n\n"
+                    f"Откатить: /rollback (из /history)"
+                )
+            else:
+                report = (
+                    f"🔍 <b>Аудит завершён, промпт не обновлён</b>\n\n"
+                    f"Текущий: {current_acc:.0%} | Новый: {new_acc:.0%}\n\n"
+                    f"Анализ: {html.escape(analysis[:400])}"
+                )
+        else:
+            # Мало данных — применяем
+            db.save_prompt_version(new_prompt, "Аудит (без валидации)")
+            report = (
+                f"✅ <b>Аудит: промпт обновлён</b> (мало данных для валидации)\n\n"
+                f"Анализ: {html.escape(analysis[:400])}\n\n"
+                f"Откатить: /rollback (из /history)"
+            )
+
+        # Добавляем wave analysis если есть
+        if wave_analysis:
+            report += f"\n\n🌊 <b>Спам-волны:</b>\n{html.escape(wave_analysis[:300])}"
+
+        await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
+
+    except Exception as e:
+        logger.error(f"Ошибка аудита: {e}", exc_info=True)
+        await bot.send_message(ADMIN_ID, f"⚠️ Ошибка аудита: {e}")
+
+
+async def detect_spam_waves(profiles: list) -> str:
+    """Анализирует профили забаненных для поиска общих паттернов (спам-волн)."""
+    if len(profiles) < 3:
+        return ""
+
+    # Группируем по общим признакам
+    bio_keywords = defaultdict(list)
+    channel_keywords = defaultdict(list)
+    message_patterns = defaultdict(list)
+
+    for row in profiles:
+        user_id, username, full_name, bio, ch_title, ch_desc, msg_text, reason, banned_at = row
+
+        # Bio keywords
+        if bio:
+            for word in bio.lower().split():
+                if len(word) > 3:
+                    bio_keywords[word].append(username or str(user_id))
+
+        # Channel keywords
+        channel_text = f"{ch_title or ''} {ch_desc or ''}".strip()
+        if channel_text:
+            for word in channel_text.lower().split():
+                if len(word) > 3:
+                    channel_keywords[word].append(username or str(user_id))
+
+        # Message patterns (first 50 chars as key)
+        if msg_text:
+            key = msg_text[:50].lower().strip()
+            message_patterns[key].append(username or str(user_id))
+
+    # Находим паттерны (слова, встречающиеся у 3+ забаненных)
+    waves = []
+
+    bio_waves = {k: v for k, v in bio_keywords.items() if len(v) >= 3}
+    if bio_waves:
+        top = sorted(bio_waves.items(), key=lambda x: -len(x[1]))[:5]
+        waves.append("Bio: " + ", ".join(f"'{k}' ({len(v)} бан.)" for k, v in top))
+
+    ch_waves = {k: v for k, v in channel_keywords.items() if len(v) >= 3}
+    if ch_waves:
+        top = sorted(ch_waves.items(), key=lambda x: -len(x[1]))[:5]
+        waves.append("Каналы: " + ", ".join(f"'{k}' ({len(v)} бан.)" for k, v in top))
+
+    msg_waves = {k: v for k, v in message_patterns.items() if len(v) >= 2}
+    if msg_waves:
+        top = sorted(msg_waves.items(), key=lambda x: -len(x[1]))[:3]
+        waves.append("Сообщения: " + ", ".join(f"«{k[:40]}» ({len(v)} бан.)" for k, v in top))
+
+    return "\n".join(waves) if waves else ""
+
+
+async def _weekly_audit_loop():
+    """Фоновый цикл: еженедельный аудит промпта."""
+    while True:
+        # Ждём 7 дней (604800 секунд)
+        await asyncio.sleep(604800)
+        try:
+            logger.info("🔍 Запуск еженедельного аудита промпта")
+            await run_full_audit()
+        except Exception as e:
+            logger.error(f"Ошибка еженедельного аудита: {e}")
+
+
+# ──────────────────────────────────────────────
+# Telegram: проверки и действия
+# ──────────────────────────────────────────────
 
 def should_skip_message(message: types.Message) -> bool:
     if message.from_user and message.from_user.is_bot:
@@ -857,6 +1108,18 @@ async def ban_and_report(message: types.Message, result: SpamResult, reasoning: 
     # Удаляем ВСЕ сообщения спамера из всех групп
     deleted = await delete_user_messages(uid)
     logger.info(f"Удалено {deleted} сообщений спамера {uid}")
+
+    # Сохраняем профиль спамера для детектора спам-волн
+    try:
+        profile = await _get_profile_data(uid)
+        db.save_banned_profile(
+            uid, message.from_user.username or '', message.from_user.full_name,
+            profile.get('bio', ''), profile.get('channel_title', ''),
+            profile.get('channel_desc', ''),
+            message.text or message.caption or '', reasoning[:200]
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить профиль спамера: {e}")
 
     text = (
         f"🔴 <b>АВТОБАН ЗА СПАМ</b>\n\n"
@@ -957,6 +1220,7 @@ async def cmd_help(message: types.Message):
         "📚 <b>Команды</b>\n\n"
         "/stats — статистика\n"
         "/improve — принудительное улучшение промпта\n"
+        "/audit — полный аудит промпта на всех данных\n"
         "/prompt — текущий промпт\n"
         "/history — история версий промпта\n"
         "/rollback N — откатить промпт к версии #N\n"
@@ -990,6 +1254,14 @@ async def cmd_improve(message: types.Message):
     """Принудительный запуск автоулучшения промпта."""
     await message.reply("🔄 Запускаю улучшение промпта...")
     asyncio.create_task(auto_improve_prompt("manual", "ручной запуск"))
+
+
+@dp.message(Command("audit"))
+@require_admin
+async def cmd_audit(message: types.Message):
+    """Полный аудит промпта на ВСЕХ данных."""
+    await message.reply("🔍 Запускаю полный аудит...")
+    asyncio.create_task(run_full_audit())
 
 
 @dp.message(Command("prompt"))
@@ -1310,6 +1582,7 @@ async def main():
         BotCommand(command="help", description="Справка"),
         BotCommand(command="stats", description="Статистика (админ)"),
         BotCommand(command="improve", description="Улучшить промпт (админ)"),
+        BotCommand(command="audit", description="Полный аудит промпта (админ)"),
         BotCommand(command="prompt", description="Текущий промпт (админ)"),
         BotCommand(command="history", description="История промптов (админ)"),
         BotCommand(command="rollback", description="Откат промпта (админ)"),
@@ -1328,6 +1601,10 @@ async def main():
         f"| model={LLM_MODEL} | improve={LLM_IMPROVEMENT_MODEL} "
         f"| auto_improve_after={AUTO_IMPROVE_AFTER_ERRORS} errors"
     )
+    # Запускаем еженедельный аудит в фоне
+    asyncio.create_task(_weekly_audit_loop())
+    logger.info("📅 Еженедельный аудит запланирован")
+
     try:
         await dp.start_polling(bot)
     finally:
