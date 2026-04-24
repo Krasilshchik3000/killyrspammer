@@ -872,17 +872,32 @@ async def run_full_audit():
 АНАЛИЗ: подробный анализ (5-10 предложений)
 ИТОГОВЫЙ_ПРОМПТ: полный новый промпт"""
 
-        response = await openai_client.chat.completions.create(
-            model=LLM_IMPROVEMENT_MODEL,
-            messages=[
-                {"role": "system", "content": "Ты эксперт по антиспам-системам. Проводишь полный аудит."},
-                {"role": "user", "content": audit_prompt},
-            ],
-            **_token_limit_param_improvement(16000),
-            temperature=0.3,
-            timeout=120,
-        )
-        text = (response.choices[0].message.content or "").strip()
+        await bot.send_message(ADMIN_ID, "🔍 Генерирую новый промпт (может занять 1-2 минуты)...")
+
+        try:
+            response = await openai_client.chat.completions.create(
+                model=LLM_IMPROVEMENT_MODEL,
+                messages=[
+                    {"role": "system", "content": "Ты эксперт по антиспам-системам. Проводишь полный аудит. ОБЯЗАТЕЛЬНО используй маркер ИТОГОВЫЙ_ПРОМПТ: перед новым промптом."},
+                    {"role": "user", "content": audit_prompt},
+                ],
+                **_token_limit_param_improvement(16000),
+                temperature=0.3,
+                timeout=180,
+            )
+            text = (response.choices[0].message.content or "").strip()
+            finish = response.choices[0].finish_reason
+            logger.info(f"Audit LLM: len={len(text)}, finish={finish}, has_marker={'ИТОГОВЫЙ_ПРОМПТ' in text}")
+        except Exception as e:
+            logger.error(f"Audit LLM call failed: {e}")
+            await bot.send_message(ADMIN_ID, f"⚠️ Ошибка при генерации нового промпта: {e}\n\nТекущий промпт не изменён.")
+            # Всё равно показываем текущий промпт
+            prompt_escaped = html.escape(current_prompt)
+            chunks = [prompt_escaped[i:i+3700] for i in range(0, len(prompt_escaped), 3700)]
+            for i, chunk in enumerate(chunks):
+                h = "📝 <b>Текущий промпт:</b>\n\n" if i == 0 else f"📝 <b>Часть {i+1}:</b>\n\n"
+                await bot.send_message(ADMIN_ID, f"{h}<code>{chunk}</code>", parse_mode='HTML')
+            return
 
         # ── Часть 1: Отчёт о текущем состоянии ──
         fp_list = "\n".join(f"  • «{html.escape(t)}»" for t, _ in false_positives[:10]) or "  (нет)"
@@ -959,8 +974,10 @@ async def run_full_audit():
                 f"  • «{t[:60]}» ({e}→{g})" for t, e, g in new_errors[:10]
             ) or "  (нет ошибок)"
 
-            verdict = "✅ ПРИМЕНЁН" if new_acc > current_acc else "❌ НЕ ПРИМЕНЁН (не лучше)"
-            if new_acc > current_acc:
+            # Применяем если лучше, ИЛИ если текущая точность критически низкая (<50%) и новый хотя бы не хуже
+            should_apply = new_acc > current_acc or (current_acc < 0.5 and new_acc >= current_acc)
+            verdict = "✅ ПРИМЕНЁН" if should_apply else "❌ НЕ ПРИМЕНЁН (не лучше)"
+            if should_apply:
                 db.save_prompt_version(new_prompt, f"Аудит: {new_acc:.0%} vs {current_acc:.0%}")
                 applied = True
 
