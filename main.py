@@ -271,6 +271,34 @@ async def check_user_profile(user_id: int) -> str:
     return ""
 
 
+def _classify_spam_type(text: str) -> str:
+    """Определяет, можно ли распознать спам по тексту или только по контексту.
+
+    'text' — текст содержит явные спам-признаки (ссылки, @username, предложения)
+    'context' — текст выглядит невинно, спам определяется по профилю/контексту
+    """
+    if not text:
+        return 'context'
+    t = text.lower()
+    # Явные текстовые спам-признаки
+    text_spam_signals = [
+        '@', 't.me/', 'http', 'подпис', 'канал', 'бот ', 'перейд',
+        'заработ', 'доход', 'инвестиц', 'крипт', 'p2p', 'казино',
+        'ставк', 'прогноз', 'сигнал', 'букмекер', 'промоутер',
+        'набор', 'ищем', 'нужны люди', 'оплата', 'выплат',
+        'пишите', 'в личку', 'лс', 'обращайтесь', 'пассивный доход',
+        'vpn', 'proxy', 'оформля', 'бесплатно', 'скидк',
+        'водитель', 'автомойк', 'разгрузк', 'промокод',
+    ]
+    for signal in text_spam_signals:
+        if signal in t:
+            return 'text'
+    # Короткий невинный текст без спам-признаков = profile spam
+    if len(text) < 80:
+        return 'context'
+    return 'text'
+
+
 async def _get_profile_data(user_id: int) -> dict:
     """Получить bio и канал пользователя через raw Bot API."""
     try:
@@ -945,7 +973,9 @@ async def run_full_audit():
         await bot.send_message(ADMIN_ID, report2, parse_mode='HTML')
 
         # ── Часть 3: Валидация нового промпта ──
-        all_eval = [(t, s) for t, s, _, _ in all_examples]
+        # Используем только text-detectable примеры (не profile spam)
+        text_examples = db.get_all_training_examples(text_only=True)
+        all_eval = [(t, s) for t, s, _, _ in text_examples]
         applied = False
 
         if len(all_eval) >= 10:
@@ -1238,7 +1268,9 @@ async def handle_forwarded_spam(message: types.Message):
 
     spam_text = message.text or message.caption or ""
     if spam_text:
-        db.add_training_example(spam_text, True, 'FORWARDED_SPAM')
+        # Определяем тип: короткий невинный текст = profile spam, иначе text spam
+        spam_type = _classify_spam_type(spam_text)
+        db.add_training_example(spam_text, True, 'FORWARDED_SPAM', spam_type)
         # Сохраняем как "ошибку бота" чтобы счётчик ошибок рос
         try:
             db.save_message(
@@ -1560,7 +1592,13 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
     is_spam = action == "spam"
 
     db.update_admin_decision(msg_id, decision)
-    db.add_training_example(message_text, is_spam, 'ADMIN_FEEDBACK')
+    # Определяем тип спама: если reasoning упоминает профиль/канал — это context spam
+    spam_type = 'text'
+    if is_spam and reasoning:
+        r_lower = (reasoning or '').lower()
+        if any(kw in r_lower for kw in ['профил', 'profile', 'канал', 'channel', 'bio', 'переслано']):
+            spam_type = 'context'
+    db.add_training_example(message_text, is_spam, 'ADMIN_FEEDBACK', spam_type)
 
     ban_info = ""
     if action == "spam" and user_id:

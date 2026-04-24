@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS training_examples (
     text TEXT,
     is_spam BOOLEAN,
     source TEXT,
+    spam_type TEXT DEFAULT 'text',
     created_at TIMESTAMP
 );
 
@@ -141,6 +142,7 @@ CREATE TABLE IF NOT EXISTS training_examples (
     text TEXT,
     is_spam BOOLEAN,
     source TEXT,
+    spam_type TEXT DEFAULT 'text',
     created_at TIMESTAMP
 );
 
@@ -264,6 +266,17 @@ def init_database():
         except Exception:
             conn.rollback()
 
+    # Миграция: добавить колонку spam_type в training_examples
+    try:
+        cursor.execute("SELECT spam_type FROM training_examples LIMIT 1")
+    except Exception:
+        conn.rollback()
+        try:
+            cursor.execute("ALTER TABLE training_examples ADD COLUMN spam_type TEXT DEFAULT 'text'")
+            logger.info("Добавлена колонка spam_type в training_examples")
+        except Exception:
+            conn.rollback()
+
     conn.commit()
     conn.close()
     logger.info("БД инициализирована")
@@ -311,10 +324,15 @@ def rollback_prompt(version_id: int) -> bool:
 # Training examples
 # ──────────────────────────────────────────────
 
-def add_training_example(text: str, is_spam: bool, source: str):
+def add_training_example(text: str, is_spam: bool, source: str, spam_type: str = 'text'):
+    """Добавить обучающий пример.
+
+    spam_type: 'text' — спам определяется по тексту, 'context' — по профилю/контексту.
+    Для валидации промпта используются только 'text' примеры.
+    """
     execute_query(
-        "INSERT INTO training_examples (text, is_spam, source, created_at) VALUES (?, ?, ?, ?)",
-        (text, is_spam, source, datetime.now())
+        "INSERT INTO training_examples (text, is_spam, source, spam_type, created_at) VALUES (?, ?, ?, ?, ?)",
+        (text, is_spam, source, spam_type, datetime.now())
     )
 
 
@@ -328,13 +346,20 @@ def get_few_shot_examples(limit=10):
 
 
 def get_validation_examples(limit=30):
-    """Получить примеры для валидации промпта (и спам, и не спам)."""
-    # Берём поровну спам и не спам для сбалансированной оценки
+    """Получить примеры для валидации промпта (и спам, и не спам).
+
+    Для спама используются только 'text' примеры (определяемые по тексту).
+    'context' примеры (профильный спам) исключаются — промпт не может их определить.
+    """
     half = limit // 2
+    # Спам: только text-detectable (не profile/context спам)
     spam = execute_query(
-        "SELECT text, is_spam FROM training_examples WHERE is_spam = ? ORDER BY id DESC LIMIT ?",
+        "SELECT text, is_spam FROM training_examples "
+        "WHERE is_spam = ? AND (spam_type = 'text' OR spam_type IS NULL) "
+        "ORDER BY id DESC LIMIT ?",
         (True, half), fetch='all'
     ) or []
+    # Не спам: все
     not_spam = execute_query(
         "SELECT text, is_spam FROM training_examples WHERE is_spam = ? ORDER BY id DESC LIMIT ?",
         (False, half), fetch='all'
@@ -541,8 +566,17 @@ def get_all_admin_decisions(limit=500):
     ) or []
 
 
-def get_all_training_examples():
-    """Все training examples (для полного аудита)."""
+def get_all_training_examples(text_only=False):
+    """Все training examples (для полного аудита).
+
+    text_only=True: только примеры с spam_type='text' (для валидации промпта).
+    """
+    if text_only:
+        return execute_query(
+            "SELECT text, is_spam, source, created_at FROM training_examples "
+            "WHERE spam_type = 'text' OR spam_type IS NULL OR is_spam = ? ORDER BY id",
+            (False,), fetch='all'
+        ) or []
     return execute_query(
         "SELECT text, is_spam, source, created_at FROM training_examples ORDER BY id",
         fetch='all'
