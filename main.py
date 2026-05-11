@@ -909,14 +909,18 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
         current_prompt = db.get_current_prompt()
         spam_examples = db.get_validation_examples(MAX_VALIDATION_EXAMPLES)  # уже фильтр по text-spam
         correct_messages = db.get_correctly_classified_messages(REGRESSION_CHECK_SAMPLES)
+        ordinary_messages = db.get_ordinary_messages(REGRESSION_CHECK_SAMPLES)
 
-        # Формируем датасет для регрессий: (text, is_spam)
+        # Формируем датасет: спам + correctly-classified + обычные сообщения
+        # is_spam=False для обычных (они НЕ должны флагаться как спам)
         regression_set = []
         for text, llm_result in correct_messages:
             is_spam = llm_result in ('СПАМ', 'ВОЗМОЖНО_СПАМ')
             regression_set.append((text, is_spam))
 
-        total_eval = len(spam_examples) + len(regression_set)
+        ordinary_set = [(text, False) for text, _ in ordinary_messages]
+
+        total_eval = len(spam_examples) + len(regression_set) + len(ordinary_set)
         if total_eval < MIN_VALIDATION_EXAMPLES:
             await _send_progress(
                 f"⚠️ Мало данных для валидации: {total_eval} (минимум {MIN_VALIDATION_EXAMPLES}). "
@@ -925,15 +929,16 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
             return
 
         await _send_progress(
-            f"📊 <b>Датасет</b>\n"
+            f"📊 <b>Датасет валидации</b>\n"
             f"  • Text-spam примеров: {len(spam_examples)}\n"
-            f"  • Correctly-classified (детектор регрессий): {len(regression_set)}\n"
-            f"  • Всего для валидации: {total_eval}"
+            f"  • Спорные правильно-классифицированные: {len(regression_set)}\n"
+            f"  • Обычные сообщения (не вызывавшие подозрений): {len(ordinary_set)}\n"
+            f"  • Всего: {total_eval}"
         )
 
         # ── Фаза 2: Оценка текущего промпта ──
         await _send_progress(f"🔍 Оцениваю текущий промпт на {total_eval} примерах...")
-        full_eval_set = spam_examples + regression_set
+        full_eval_set = spam_examples + regression_set + ordinary_set
         current_acc, current_ok, current_total, current_errors = await evaluate_prompt(current_prompt, full_eval_set)
 
         if current_total == 0:
@@ -1005,16 +1010,13 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
             # Полная валидация
             new_acc, new_ok, new_total, new_errors = await evaluate_prompt(improved, full_eval_set)
 
-            # Считаем регрессии: было правильно — стало неправильно
-            regressions = 0
-            for err_text, _, _ in new_errors:
-                # err_text это первые 120 символов из evaluate_prompt
-                for orig_text in current_correct_set:
-                    if orig_text[:120] == err_text:
-                        regressions += 1
-                        break
+            # Считаем регрессии (было правильно → стало неправильно) и fixes (наоборот)
+            current_error_set = set(e[0] for e in current_errors)
+            new_error_set = set(e[0] for e in new_errors)
+            regressions = len(new_error_set - current_error_set)  # новые ошибки
+            fixes = len(current_error_set - new_error_set)  # исправленные ошибки
 
-            # FP/FN считаем на spam_examples (где известна метка)
+            # FP/FN считаем
             fp, fn = 0, 0
             for err_text, expected, got in new_errors:
                 if expected == "SPAM" and got == "NOT_SPAM":
@@ -1026,7 +1028,8 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
             await _send_progress(
                 f"{verdict_emoji} <b>Попытка {i} результат:</b>\n"
                 f"  Точность: {new_acc:.0%} (было {current_acc:.0%})\n"
-                f"  Регрессий: {regressions} | FP: {fp} | FN: {fn}"
+                f"  Исправлено: {fixes} | Регрессий: {regressions}\n"
+                f"  FP: {fp} | FN: {fn}"
             )
 
             candidates.append({
@@ -1037,6 +1040,7 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
                 "ok": new_ok,
                 "total": new_total,
                 "regressions": regressions,
+                "fixes": fixes,
                 "fp": fp,
                 "fn": fn,
                 "attempt": i,
@@ -1053,52 +1057,53 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
             )
             return
 
-        # Сортируем кандидатов: сначала по приросту точности, потом по минимуму регрессий
-        candidates.sort(key=lambda c: (c["accuracy"], -c["regressions"]), reverse=True)
+        # Сортируем по net gain (fixes - regressions), затем по точности
+        candidates.sort(key=lambda c: (c["fixes"] - c["regressions"], c["accuracy"]), reverse=True)
         best = candidates[0]
 
-        # Критерии применения
+        # Критерии: net-positive (исправил > сломал) И точность не упала
         accuracy_gain = best["accuracy"] - current_acc
-        meets_gain = accuracy_gain >= MIN_ACCURACY_GAIN
-        meets_regression = best["regressions"] <= MAX_REGRESSIONS
-        # Если текущая точность критически низкая — мягче критерии
-        critical_low = current_acc < 0.5
+        net_gain = best["fixes"] - best["regressions"]
 
         should_apply = False
         reason = ""
-        if meets_gain and meets_regression:
+        if net_gain > 0 and accuracy_gain > 0:
             should_apply = True
-            reason = f"Прирост точности {accuracy_gain:+.0%}, регрессий {best['regressions']} (≤{MAX_REGRESSIONS})"
-        elif critical_low and best["accuracy"] > current_acc:
+            reason = (
+                f"Net-positive: исправил {best['fixes']}, сломал {best['regressions']} "
+                f"(чистый выигрыш +{net_gain}). Точность {accuracy_gain:+.0%}"
+            )
+        elif current_acc < 0.5 and best["accuracy"] > current_acc:
             should_apply = True
-            reason = f"Текущая точность критически низкая ({current_acc:.0%}), применяю лучший вариант"
+            reason = f"Текущая точность критически низкая ({current_acc:.0%}), применяю лучший"
         else:
-            if not meets_gain:
-                reason = f"Прирост {accuracy_gain:+.0%} меньше порога {MIN_ACCURACY_GAIN:.0%}"
-            elif not meets_regression:
-                reason = f"Регрессий {best['regressions']} больше порога {MAX_REGRESSIONS}"
+            if net_gain <= 0:
+                reason = f"Net-negative: регрессий {best['regressions']} ≥ исправлений {best['fixes']}"
+            elif accuracy_gain <= 0:
+                reason = f"Точность не выросла ({accuracy_gain:+.0%})"
 
-        # Сводка по всем кандидатам
+        # Сводка по всем кандидатам — с net gain
         summary_lines = ["📋 <b>Все попытки:</b>"]
         for c in candidates:
             mark = "🏆" if c is best else "•"
+            net = c["fixes"] - c["regressions"]
             summary_lines.append(
                 f"  {mark} #{c['attempt']} «{c['strategy']}»: {c['accuracy']:.0%}, "
-                f"рег={c['regressions']}, FP={c['fp']}, FN={c['fn']}"
+                f"fix={c['fixes']}, рег={c['regressions']}, net={net:+d}"
             )
         await _send_progress("\n".join(summary_lines))
 
         if should_apply:
             db.save_prompt_version(
                 best["prompt"],
-                f"Авто ({best['strategy']}): {best['accuracy']:.0%} vs {current_acc:.0%}, рег={best['regressions']}"
+                f"Авто ({best['strategy']}): {best['accuracy']:.0%} vs {current_acc:.0%}, net={net_gain:+d}"
             )
             await _send_progress(
                 f"✅ <b>Промпт обновлён</b>\n"
                 f"Стратегия: «{best['strategy']}»\n"
                 f"Точность: {current_acc:.0%} → {best['accuracy']:.0%}\n"
-                f"Регрессий: {best['regressions']}\n"
-                f"Причина применения: {reason}\n\n"
+                f"Исправлено: {best['fixes']} | Регрессий: {best['regressions']} | Net: {net_gain:+d}\n"
+                f"Причина: {reason}\n\n"
                 f"<b>Анализ:</b> {html.escape(best['analysis'][:400])}\n\n"
                 f"Откатить: /rollback (см. /history)"
             )

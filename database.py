@@ -584,6 +584,24 @@ def get_correctly_classified_messages(limit=30):
     ) or []
 
 
+def get_ordinary_messages(limit=50):
+    """Получить недавние сообщения, которые бот классифицировал как НЕ_СПАМ
+    и которые не отправлялись на ревью. Это "обычные" сообщения от живых людей.
+
+    Используется в валидации: новый промпт не должен начинать флагать обычный текст.
+    Фильтруем короткие/пустые сообщения и системные.
+    """
+    return execute_query(
+        """SELECT text, llm_result FROM messages
+           WHERE llm_result = 'НЕ_СПАМ'
+             AND admin_decision IS NULL
+             AND text IS NOT NULL
+             AND LENGTH(text) > 5
+           ORDER BY created_at DESC LIMIT ?""",
+        (limit,), fetch='all'
+    ) or []
+
+
 def get_all_training_examples(text_only=False):
     """Все training examples (для полного аудита).
 

@@ -176,10 +176,15 @@ class TestAutoImprovePrompt:
             return ("Анализ", "improved {message_text} СПАМ НЕ_СПАМ ВОЗМОЖНО_СПАМ {few_shot_block}")
 
         async def fake_eval(prompt, examples):
-            # текущий промпт: 0.7, новый: 0.9
+            # текущий промпт ошибается на err1/err2/err3; новый — только на err1
+            # fixes = 2, regressions = 0, net = +2, accuracy выше
             if "improved" in prompt:
-                return (0.9, 9, 10, [])
-            return (0.7, 7, 10, [])
+                return (0.9, 9, 10, [("err1", "SPAM", "NOT_SPAM")])
+            return (0.7, 7, 10, [
+                ("err1", "SPAM", "NOT_SPAM"),
+                ("err2", "SPAM", "NOT_SPAM"),
+                ("err3", "SPAM", "NOT_SPAM"),
+            ])
 
         with patch.object(main, 'generate_improved_prompt_with_strategy', side_effect=fake_gen), \
              patch.object(main, 'evaluate_prompt', side_effect=fake_eval), \
@@ -188,6 +193,7 @@ class TestAutoImprovePrompt:
             mock_db.count_training_examples.return_value = 20
             mock_db.get_validation_examples.return_value = [("spam example text", True)] * 10
             mock_db.get_correctly_classified_messages.return_value = [("normal msg", "НЕ_СПАМ")] * 5
+            mock_db.get_ordinary_messages.return_value = [("hello", "НЕ_СПАМ")] * 5
             mock_db.get_current_prompt.return_value = "old prompt with {message_text} СПАМ НЕ_СПАМ ВОЗМОЖНО_СПАМ {few_shot_block}"
             mock_bot.send_message = AsyncMock()
 
@@ -208,8 +214,9 @@ class TestAutoImprovePrompt:
 
         async def fake_eval(prompt, examples):
             if "worse" in prompt:
-                return (0.6, 6, 10, [])  # хуже текущего
-            return (0.9, 9, 10, [])  # текущий 90%
+                # новый ломает 4 примера, исправляет 1 → net=-3
+                return (0.6, 6, 10, [("e1", "S", "N"), ("e2", "S", "N"), ("e3", "S", "N"), ("e4", "S", "N")])
+            return (0.9, 9, 10, [("e5", "S", "N")])  # текущий ошибается только на e5
 
         with patch.object(main, 'generate_improved_prompt_with_strategy', side_effect=fake_gen), \
              patch.object(main, 'evaluate_prompt', side_effect=fake_eval), \
@@ -218,6 +225,7 @@ class TestAutoImprovePrompt:
             mock_db.count_training_examples.return_value = 20
             mock_db.get_validation_examples.return_value = [("spam example", True)] * 10
             mock_db.get_correctly_classified_messages.return_value = [("normal msg", "НЕ_СПАМ")] * 5
+            mock_db.get_ordinary_messages.return_value = [("ordinary", "НЕ_СПАМ")] * 5
             mock_db.get_current_prompt.return_value = "good prompt {message_text} СПАМ НЕ_СПАМ ВОЗМОЖНО_СПАМ {few_shot_block}"
             mock_bot.send_message = AsyncMock()
 
