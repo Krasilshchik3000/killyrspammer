@@ -27,12 +27,18 @@ from openai import AsyncOpenAI
 
 from config import (
     BOT_TOKEN, OPENAI_API_KEY, ADMIN_ID, ALLOWED_GROUP_IDS,
-    LLM_MODEL, LLM_IMPROVEMENT_MODEL, LLM_VALIDATION_MODEL, LLM_MAX_TOKENS,
-    LLM_TEMPERATURE, LLM_TIMEOUT, MAX_REQUESTS_PER_MINUTE,
+    LLM_MODEL_CANDIDATES, LLM_IMPROVEMENT_MODEL_CANDIDATES,
+    LLM_MAX_TOKENS, LLM_TEMPERATURE, LLM_TIMEOUT, MAX_REQUESTS_PER_MINUTE,
     FEW_SHOT_EXAMPLES_COUNT, CAS_API_URL, TRUSTED_USER_MESSAGES,
     AUTO_IMPROVE_AFTER_ERRORS, MIN_VALIDATION_EXAMPLES, MAX_VALIDATION_EXAMPLES,
     MAX_IMPROVEMENT_ATTEMPTS, REGRESSION_CHECK_SAMPLES, MIN_ACCURACY_GAIN, MAX_REGRESSIONS,
 )
+from config import LLM_MODEL as _ENV_LLM_MODEL
+from config import LLM_IMPROVEMENT_MODEL as _ENV_LLM_IMPROVEMENT_MODEL
+
+# Реально используемые модели (определяются на старте через autodetect)
+LLM_MODEL = _ENV_LLM_MODEL or LLM_MODEL_CANDIDATES[0]
+LLM_IMPROVEMENT_MODEL = _ENV_LLM_IMPROVEMENT_MODEL or LLM_IMPROVEMENT_MODEL_CANDIDATES[0]
 import database as db
 from text_normalize import normalize_text
 
@@ -52,6 +58,67 @@ _improvement_in_progress = False
 def _is_reasoning_model(model: str) -> bool:
     """Reasoning models (gpt-5+, o-series) имеют особые требования к параметрам."""
     return model.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+async def _probe_model(model: str) -> tuple[bool, str]:
+    """Проверяет доступность модели одним минимальным запросом.
+    Возвращает (доступна, описание_ошибки_если_нет)."""
+    try:
+        params = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ok"}],
+            "timeout": 10,
+        }
+        if _is_reasoning_model(model):
+            params["max_completion_tokens"] = 5
+        else:
+            params["max_tokens"] = 5
+            params["temperature"] = 0
+        await openai_client.chat.completions.create(**params)
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:200]}"
+
+
+async def _autodetect_models() -> dict:
+    """Подбирает доступные модели из списков-кандидатов.
+    Возвращает {classification, improvement, errors: [...]} для отчёта."""
+    global LLM_MODEL, LLM_IMPROVEMENT_MODEL
+
+    result = {"classification": None, "improvement": None, "errors": []}
+
+    # Если env переменная задана — используем её без проверки
+    if _ENV_LLM_MODEL:
+        result["classification"] = _ENV_LLM_MODEL
+        logger.info(f"LLM_MODEL задан через env: {_ENV_LLM_MODEL}")
+    else:
+        for candidate in LLM_MODEL_CANDIDATES:
+            ok, err = await _probe_model(candidate)
+            if ok:
+                LLM_MODEL = candidate
+                result["classification"] = candidate
+                logger.info(f"✅ Автодетект LLM_MODEL: {candidate}")
+                break
+            else:
+                result["errors"].append(f"{candidate}: {err[:80]}")
+                logger.warning(f"❌ {candidate} недоступна: {err[:80]}")
+
+    if _ENV_LLM_IMPROVEMENT_MODEL:
+        result["improvement"] = _ENV_LLM_IMPROVEMENT_MODEL
+        logger.info(f"LLM_IMPROVEMENT_MODEL задан через env: {_ENV_LLM_IMPROVEMENT_MODEL}")
+    else:
+        for candidate in LLM_IMPROVEMENT_MODEL_CANDIDATES:
+            ok, err = await _probe_model(candidate)
+            if ok:
+                LLM_IMPROVEMENT_MODEL = candidate
+                result["improvement"] = candidate
+                logger.info(f"✅ Автодетект LLM_IMPROVEMENT_MODEL: {candidate}")
+                break
+            else:
+                result["errors"].append(f"{candidate}: {err[:80]}")
+                logger.warning(f"❌ {candidate} недоступна: {err[:80]}")
+
+    return result
 
 
 def _token_limit_param(max_tokens: int) -> dict:
@@ -1567,6 +1634,7 @@ async def cmd_help(message: types.Message):
         "/stats — статистика\n"
         "/improve — принудительное улучшение промпта\n"
         "/audit — полный аудит промпта на всех данных\n"
+        "/models — какие LLM-модели сейчас используются\n"
         "/prompt — текущий промпт\n"
         "/history — история версий промпта\n"
         "/rollback N — откатить промпт к версии #N\n"
@@ -1608,6 +1676,29 @@ async def cmd_audit(message: types.Message):
     """Полный аудит промпта на ВСЕХ данных."""
     await message.reply("🔍 Запускаю полный аудит...")
     asyncio.create_task(run_full_audit())
+
+
+@dp.message(Command("models"))
+@require_admin
+async def cmd_models(message: types.Message):
+    """Показывает текущие модели и проверяет доступность всех кандидатов."""
+    await message.reply("🔍 Проверяю доступность моделей...")
+    lines = [
+        f"🤖 <b>Используются сейчас:</b>",
+        f"  • Классификация: <code>{html.escape(LLM_MODEL)}</code>",
+        f"  • Улучшение промпта: <code>{html.escape(LLM_IMPROVEMENT_MODEL)}</code>",
+        "",
+        "<b>Проверка кандидатов:</b>",
+    ]
+    all_candidates = list(dict.fromkeys(LLM_MODEL_CANDIDATES + LLM_IMPROVEMENT_MODEL_CANDIDATES))
+    for c in all_candidates:
+        ok, err = await _probe_model(c)
+        if ok:
+            lines.append(f"  ✅ <code>{html.escape(c)}</code>")
+        else:
+            short_err = err.split(":")[0] if err else "error"
+            lines.append(f"  ❌ <code>{html.escape(c)}</code> — {html.escape(short_err)}")
+    await message.reply("\n".join(lines), parse_mode='HTML')
 
 
 @dp.message(Command("prompt"))
@@ -1939,6 +2030,7 @@ async def main():
         BotCommand(command="stats", description="Статистика (админ)"),
         BotCommand(command="improve", description="Улучшить промпт (админ)"),
         BotCommand(command="audit", description="Полный аудит промпта (админ)"),
+        BotCommand(command="models", description="Проверить доступные LLM модели (админ)"),
         BotCommand(command="prompt", description="Текущий промпт (админ)"),
         BotCommand(command="history", description="История промптов (админ)"),
         BotCommand(command="rollback", description="Откат промпта (админ)"),
@@ -1952,23 +2044,31 @@ async def main():
     except Exception:
         pass
 
+    # Автодетект моделей (пробуем каждую из списка до первой рабочей)
+    detection = await _autodetect_models()
+
     logger.info(
         f"🤖 Kill Yr Spammers | admin={ADMIN_ID} | groups={len(ALLOWED_GROUP_IDS)} "
         f"| model={LLM_MODEL} | improve={LLM_IMPROVEMENT_MODEL} "
         f"| auto_improve_after={AUTO_IMPROVE_AFTER_ERRORS} errors"
     )
 
-    # Самотест модели — пробуем классифицировать одно сообщение
+    # Отчёт админу о выбранных моделях
     try:
-        test_result, _ = await classify_message(db.get_current_prompt(), "тест классификации")
-        logger.info(f"✅ Модель {LLM_MODEL} работает (тестовое сообщение → {test_result.value})")
+        report_lines = ["🚀 <b>Бот запущен</b>"]
+        if detection["classification"]:
+            report_lines.append(f"  • Классификация: <code>{detection['classification']}</code>")
+        else:
+            report_lines.append("  • ❌ Не найдена рабочая модель классификации!")
+        if detection["improvement"]:
+            report_lines.append(f"  • Улучшение промпта: <code>{detection['improvement']}</code>")
+        else:
+            report_lines.append("  • ❌ Не найдена рабочая модель улучшения!")
+        if detection["errors"]:
+            report_lines.append(f"\n<i>Проверено моделей: {len(detection['errors'])} не работают</i>")
+        await bot.send_message(ADMIN_ID, "\n".join(report_lines), parse_mode='HTML')
     except Exception as e:
-        err_msg = f"❌ Модель {LLM_MODEL} не работает: {type(e).__name__}: {str(e)[:300]}"
-        logger.error(err_msg)
-        try:
-            await bot.send_message(ADMIN_ID, err_msg)
-        except Exception:
-            pass
+        logger.warning(f"Не удалось отправить startup-отчёт: {e}")
 
     # Запускаем еженедельный аудит в фоне
     asyncio.create_task(_weekly_audit_loop())

@@ -45,15 +45,13 @@ class TestOpenAISDKCompatibility(unittest.TestCase):
         )
 
     def test_token_limit_param_returns_correct_key(self):
-        """Хелпер _token_limit_param должен возвращать правильный ключ для gpt-5.4."""
+        """Хелпер _token_limit_param возвращает max_completion_tokens для reasoning моделей."""
         import sys
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-        from main import _token_limit_param, _token_limit_param_improvement
+        from main import _token_limit_param, _token_limit_param_improvement, LLM_MODEL, LLM_IMPROVEMENT_MODEL
 
         result = _token_limit_param(30)
-        # Для gpt-5.4 модели (по умолчанию) должен быть max_completion_tokens
-        from config import LLM_MODEL
         if LLM_MODEL.startswith(("gpt-5", "o1", "o3", "o4")):
             self.assertIn("max_completion_tokens", result)
             self.assertNotIn("max_tokens", result)
@@ -61,7 +59,6 @@ class TestOpenAISDKCompatibility(unittest.TestCase):
             self.assertIn("max_tokens", result)
 
         result2 = _token_limit_param_improvement(3000)
-        from config import LLM_IMPROVEMENT_MODEL
         if LLM_IMPROVEMENT_MODEL.startswith(("gpt-5", "o1", "o3", "o4")):
             self.assertIn("max_completion_tokens", result2)
 

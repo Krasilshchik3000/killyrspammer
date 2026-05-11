@@ -32,11 +32,22 @@ DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL (Railway)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "antispam.db")  # SQLite (локальная)
 
 # Настройки LLM
-# gpt-5.4-nano: самая дешёвая ($0.20/1M), отлично классифицирует спам
-# gpt-5.4-mini: для улучшения промптов (мощнее, $0.75/1M)
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.5-nano")
-LLM_IMPROVEMENT_MODEL = os.getenv("LLM_IMPROVEMENT_MODEL", "gpt-5.5")
-LLM_VALIDATION_MODEL = os.getenv("LLM_VALIDATION_MODEL", "gpt-5.5-nano")
+# Список моделей в порядке предпочтения. Бот при старте автодетектит
+# первую доступную модель из каждого списка и использует её.
+# Можно переопределить через env переменную LLM_MODEL (одна модель).
+LLM_MODEL_CANDIDATES = [
+    "gpt-5.5-nano", "gpt-5.5-mini", "gpt-5.4-nano", "gpt-5.4-mini",
+    "gpt-5-nano", "gpt-5-mini", "gpt-4.1-nano", "gpt-4o-mini",
+]
+LLM_IMPROVEMENT_MODEL_CANDIDATES = [
+    "gpt-5.5", "gpt-5.5-mini", "gpt-5.4", "gpt-5.4-mini",
+    "gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o",
+]
+
+# Переопределение через env (если задано — используется именно эта модель, без автодетекта)
+LLM_MODEL = os.getenv("LLM_MODEL", "")
+LLM_IMPROVEMENT_MODEL = os.getenv("LLM_IMPROVEMENT_MODEL", "")
+LLM_VALIDATION_MODEL = os.getenv("LLM_VALIDATION_MODEL", "")
 LLM_MAX_TOKENS = 150  # Enough for {"result":"...","reasoning":"..."}
 LLM_TEMPERATURE = 0
 LLM_TIMEOUT = 10
