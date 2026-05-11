@@ -619,16 +619,21 @@ async def check_message_with_llm(
 async def evaluate_prompt(prompt_template: str, examples: list) -> tuple[float, int, int, list]:
     """Оценить промпт на примерах параллельно (батчами по 10).
 
+    Использует тот же few_shot_block, что и в проде — чтобы валидация
+    отражала реальное поведение бота.
+
     examples: [(text, is_spam), ...]
     Возвращает (accuracy, correct, total, errors).
-    errors: [(text, expected, got), ...] — конкретные ошибочные примеры
     """
     if not examples:
         return 0.0, 0, 0, []
 
+    # ВАЖНО: используем те же few-shot примеры, что и в production
+    few_shot = build_few_shot_block()
+
     async def classify_one(text: str, is_spam: bool):
         try:
-            result, _ = await classify_message(prompt_template, text)
+            result, _ = await classify_message(prompt_template, text, few_shot=few_shot)
             predicted_spam = result in (SpamResult.SPAM, SpamResult.MAYBE_SPAM)
             actual_spam = bool(is_spam)
             return text, is_spam, predicted_spam, actual_spam, None
