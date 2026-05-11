@@ -921,43 +921,28 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
         await _send_progress(f"🔄 <b>Запуск автообучения</b>\nТриггер: {html.escape(trigger_error_type)}")
 
         current_prompt = db.get_current_prompt()
-        spam_examples = db.get_validation_examples(MAX_VALIDATION_EXAMPLES)  # из training_examples
-        correct_messages = db.get_correctly_classified_messages(REGRESSION_CHECK_SAMPLES)
-        ordinary_messages = db.get_ordinary_messages(ORDINARY_MESSAGES_SAMPLES)
-        autobanned = db.get_autobanned_spam(ORDINARY_MESSAGES_SAMPLES)  # подтверждённый спам
 
-        # Спам-сет: training examples + автозабаненные (с дедупликацией по тексту)
-        seen_texts = set()
-        full_spam_set = []
-        for text, is_spam in spam_examples:
-            key = text[:120]
-            if key not in seen_texts:
-                seen_texts.add(key)
-                full_spam_set.append((text, is_spam))
-        for (text,) in autobanned:
-            key = text[:120]
-            if key not in seen_texts:
-                seen_texts.add(key)
-                full_spam_set.append((text, True))
+        # Единый датасет с известной ground truth.
+        # Для каждого сообщения метка определяется так:
+        #   - есть admin_decision → используем её
+        #   - нет admin_decision, llm_result = СПАМ/НЕ_СПАМ → используем llm_result
+        #   - llm_result = ВОЗМОЖНО_СПАМ без admin_decision → ПРОПУСКАЕМ (неизвестно)
+        dataset = db.get_validation_dataset(limit=ORDINARY_MESSAGES_SAMPLES * 4)
 
-        # Регрессионный сет (прошедшие ревью админа)
-        regression_set = []
-        for text, llm_result in correct_messages:
-            is_spam = llm_result in ('СПАМ', 'ВОЗМОЖНО_СПАМ')
+        # Дедупликация по тексту (на случай если одно сообщение в БД дважды)
+        seen = set()
+        full_eval_set = []
+        source_counts = {'admin_spam': 0, 'admin_not_spam': 0,
+                         'bot_spam_no_admin': 0, 'bot_not_spam_no_admin': 0}
+        for text, is_spam, source in dataset:
             key = text[:120]
-            if key not in seen_texts:
-                seen_texts.add(key)
-                regression_set.append((text, is_spam))
+            if key in seen:
+                continue
+            seen.add(key)
+            full_eval_set.append((text, is_spam))
+            source_counts[source] = source_counts.get(source, 0) + 1
 
-        # Обычные сообщения (без ревью, is_spam=False)
-        ordinary_set = []
-        for text, _ in ordinary_messages:
-            key = text[:120]
-            if key not in seen_texts:
-                seen_texts.add(key)
-                ordinary_set.append((text, False))
-
-        total_eval = len(full_spam_set) + len(regression_set) + len(ordinary_set)
+        total_eval = len(full_eval_set)
         if total_eval < MIN_VALIDATION_EXAMPLES:
             await _send_progress(
                 f"⚠️ Мало данных для валидации: {total_eval} (минимум {MIN_VALIDATION_EXAMPLES}). "
@@ -965,26 +950,23 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
             )
             return
 
-        # Считаем разбивку и общее количество доступных данных
-        spam_total_in_set = sum(1 for _, is_s in full_spam_set if is_s)
-        notspam_total_in_set = len(full_spam_set) - spam_total_in_set
-        reg_spam = sum(1 for _, is_s in regression_set if is_s)
-        reg_notspam = len(regression_set) - reg_spam
-        total_training = db.count_training_examples()
-        total_reviewed = db.count_correctly_classified()
-        total_ordinary = db.count_ordinary_messages()
-        total_autobanned = db.count_autobanned_spam()
+        # Статистика по доступным данным во всей БД
+        db_stats = db.count_validation_dataset()
+        spam_count = source_counts['admin_spam'] + source_counts['bot_spam_no_admin']
+        notspam_count = source_counts['admin_not_spam'] + source_counts['bot_not_spam_no_admin']
 
         await _send_progress(
             f"📊 <b>Датасет валидации</b>\n"
-            f"  • Подтверждённый спам: <b>{spam_total_in_set}</b> "
-            f"(из training: {total_training}, из автобанов: {total_autobanned})\n"
-            f"  • Не-спам из training: <b>{notspam_total_in_set}</b>\n"
-            f"  • Прошедшие ревью админа: <b>{len(regression_set)}</b> из {total_reviewed} "
-            f"(спам: {reg_spam}, не-спам: {reg_notspam})\n"
-            f"  • Обычные сообщения без ревью: <b>{len(ordinary_set)}</b> из {total_ordinary} "
-            f"(cap для скорости)\n"
-            f"  • <b>Всего после дедупликации: {total_eval}</b>"
+            f"<i>Метка = решение админа (если есть) либо решение бота. "
+            f"ВОЗМОЖНО_СПАМ без действия админа пропускается.</i>\n\n"
+            f"  • Спам (метка SPAM): <b>{spam_count}</b>\n"
+            f"     ├ Подтверждено админом: {source_counts['admin_spam']}\n"
+            f"     └ Забанено ботом без оспаривания: {source_counts['bot_spam_no_admin']}\n"
+            f"  • Не-спам (метка NOT_SPAM): <b>{notspam_count}</b>\n"
+            f"     ├ Подтверждено админом: {source_counts['admin_not_spam']}\n"
+            f"     └ Пропущено ботом без замечаний: {source_counts['bot_not_spam_no_admin']}\n"
+            f"  • <b>Всего для валидации: {total_eval}</b>\n\n"
+            f"<i>Пропущено (статус неизвестен): {db_stats['skipped_maybe_spam']} ВОЗМОЖНО_СПАМ без действий админа</i>"
         )
 
         # Анализ спам-волн (паттерны у недавних забаненных)
@@ -1003,7 +985,6 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
 
         # ── Фаза 2: Оценка текущего промпта ──
         await _send_progress(f"🔍 Оцениваю текущий промпт на {total_eval} примерах...")
-        full_eval_set = full_spam_set + regression_set + ordinary_set
         current_acc, current_ok, current_total, current_errors = await evaluate_prompt(current_prompt, full_eval_set)
 
         if current_total == 0:

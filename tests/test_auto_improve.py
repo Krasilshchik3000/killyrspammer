@@ -191,10 +191,17 @@ class TestAutoImprovePrompt:
              patch.object(main, 'bot') as mock_bot, \
              patch.object(main, 'db') as mock_db:
             mock_db.count_training_examples.return_value = 20
-            mock_db.get_validation_examples.return_value = [(f"spam example {i}", True) for i in range(10)]
-            mock_db.get_correctly_classified_messages.return_value = [(f"normal msg {i}", "НЕ_СПАМ") for i in range(5)]
-            mock_db.get_ordinary_messages.return_value = [(f"hello {i}", "НЕ_СПАМ") for i in range(5)]
-            mock_db.get_autobanned_spam.return_value = []
+            mock_db.get_validation_dataset.return_value = [
+                (f"spam {i}", True, 'admin_spam') for i in range(10)
+            ] + [
+                (f"ham {i}", False, 'bot_not_spam_no_admin') for i in range(10)
+            ]
+            mock_db.count_validation_dataset.return_value = {
+                'admin_spam': 10, 'admin_not_spam': 0,
+                'bot_spam_no_admin': 0, 'bot_not_spam_no_admin': 10,
+                'skipped_maybe_spam': 5,
+            }
+            mock_db.get_recent_banned_profiles.return_value = []
             mock_db.get_current_prompt.return_value = "old prompt with {message_text} СПАМ НЕ_СПАМ ВОЗМОЖНО_СПАМ {few_shot_block}"
             mock_bot.send_message = AsyncMock()
 
@@ -224,10 +231,17 @@ class TestAutoImprovePrompt:
              patch.object(main, 'bot') as mock_bot, \
              patch.object(main, 'db') as mock_db:
             mock_db.count_training_examples.return_value = 20
-            mock_db.get_validation_examples.return_value = [(f"spam example {i}", True) for i in range(10)]
-            mock_db.get_correctly_classified_messages.return_value = [(f"normal msg {i}", "НЕ_СПАМ") for i in range(5)]
-            mock_db.get_ordinary_messages.return_value = [(f"ordinary {i}", "НЕ_СПАМ") for i in range(5)]
-            mock_db.get_autobanned_spam.return_value = []
+            mock_db.get_validation_dataset.return_value = [
+                (f"spam {i}", True, 'admin_spam') for i in range(10)
+            ] + [
+                (f"ham {i}", False, 'bot_not_spam_no_admin') for i in range(10)
+            ]
+            mock_db.count_validation_dataset.return_value = {
+                'admin_spam': 10, 'admin_not_spam': 0,
+                'bot_spam_no_admin': 0, 'bot_not_spam_no_admin': 10,
+                'skipped_maybe_spam': 5,
+            }
+            mock_db.get_recent_banned_profiles.return_value = []
             mock_db.get_current_prompt.return_value = "good prompt {message_text} СПАМ НЕ_СПАМ ВОЗМОЖНО_СПАМ {few_shot_block}"
             mock_bot.send_message = AsyncMock()
 

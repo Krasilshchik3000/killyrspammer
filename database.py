@@ -655,6 +655,72 @@ def count_autobanned_spam() -> int:
     return row[0] if row else 0
 
 
+def get_validation_dataset(limit: int = 1000):
+    """Возвращает все сообщения с известной ground truth для валидации.
+
+    Правила определения метки is_spam:
+      - admin_decision = 'СПАМ' → is_spam=True (админ подтвердил спам)
+      - admin_decision = 'НЕ_СПАМ' → is_spam=False (админ отметил не-спам)
+      - admin_decision IS NULL AND llm_result = 'СПАМ' → is_spam=True (бот забанил, админ не оспорил)
+      - admin_decision IS NULL AND llm_result = 'НЕ_СПАМ' → is_spam=False (бот пропустил, админ не вмешался)
+
+    ПРОПУСКАЕТСЯ:
+      - llm_result = 'ВОЗМОЖНО_СПАМ' AND admin_decision IS NULL — статус неизвестен
+      - Пустые / слишком короткие тексты
+
+    Возвращает [(text, is_spam, source), ...] с указанием источника метки.
+    """
+    rows = execute_query(
+        """SELECT text, llm_result, admin_decision FROM messages
+           WHERE text IS NOT NULL AND LENGTH(text) > 5
+             AND NOT (admin_decision IS NULL AND llm_result = 'ВОЗМОЖНО_СПАМ')
+             AND NOT (admin_decision IS NULL AND llm_result IS NULL)
+           ORDER BY created_at DESC LIMIT ?""",
+        (limit,), fetch='all'
+    ) or []
+
+    result = []
+    for text, llm_result, admin_decision in rows:
+        if admin_decision == 'СПАМ':
+            result.append((text, True, 'admin_spam'))
+        elif admin_decision == 'НЕ_СПАМ':
+            result.append((text, False, 'admin_not_spam'))
+        elif llm_result == 'СПАМ':
+            result.append((text, True, 'bot_spam_no_admin'))
+        elif llm_result == 'НЕ_СПАМ':
+            result.append((text, False, 'bot_not_spam_no_admin'))
+    return result
+
+
+def count_validation_dataset() -> dict:
+    """Статистика по доступным для валидации сообщениям."""
+    result = {
+        'admin_spam': 0,
+        'admin_not_spam': 0,
+        'bot_spam_no_admin': 0,
+        'bot_not_spam_no_admin': 0,
+        'skipped_maybe_spam': 0,
+    }
+    rows = execute_query(
+        """SELECT llm_result, admin_decision, COUNT(*) FROM messages
+           WHERE text IS NOT NULL AND LENGTH(text) > 5
+           GROUP BY llm_result, admin_decision""",
+        fetch='all'
+    ) or []
+    for llm_result, admin_decision, count in rows:
+        if admin_decision == 'СПАМ':
+            result['admin_spam'] += count
+        elif admin_decision == 'НЕ_СПАМ':
+            result['admin_not_spam'] += count
+        elif llm_result == 'СПАМ':
+            result['bot_spam_no_admin'] += count
+        elif llm_result == 'НЕ_СПАМ':
+            result['bot_not_spam_no_admin'] += count
+        elif llm_result == 'ВОЗМОЖНО_СПАМ':
+            result['skipped_maybe_spam'] += count
+    return result
+
+
 def get_all_training_examples(text_only=False):
     """Все training examples (для полного аудита).
 
