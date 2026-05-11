@@ -173,40 +173,39 @@ class TestDBMigration(unittest.TestCase):
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
 
-    def test_old_prompt_gets_migrated(self):
-        """Если в БД старый промпт (без маркеров нового), он должен обновиться."""
+    def test_prompt_not_overwritten_on_init(self):
+        """init_database НЕ должна перезаписывать существующий промпт.
+
+        Эта миграция была удалена — она перезаписывала авто-улучшенные промпты
+        и портила качество. Тест проверяет, что любой существующий промпт сохраняется.
+        """
         import sys
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-        old_prompt = "Определи, это спам или нет. {message_text} СПАМ, НЕ_СПАМ, ВОЗМОЖНО_СПАМ"
+        custom_prompt = "Любой промпт {message_text} {few_shot_block} SPAM NOT_SPAM MAYBE_SPAM"
 
         with patch("database.DATABASE_URL", None), \
              patch("database.DATABASE_PATH", self.db_path):
             import database as db
-            # Переинициализируем
             db.DATABASE_URL = None
             db.DATABASE_PATH = self.db_path
 
             db.init_database()
 
-            # Подменим промпт на старый
             conn = sqlite3.connect(self.db_path)
             conn.execute("DELETE FROM prompt_versions")
             conn.execute(
                 "INSERT INTO prompt_versions (prompt_text, reason, created_at) VALUES (?, ?, ?)",
-                (old_prompt, "old", datetime.now())
+                (custom_prompt, "user", datetime.now())
             )
             conn.commit()
             conn.close()
 
-            # Повторная инициализация должна обновить промпт
             db.init_database()
 
             current = db.get_current_prompt()
-            self.assertIn("БЕЗОПАСНОСТЬ", current,
-                          "После миграции промпт должен содержать 'БЕЗОПАСНОСТЬ'")
-            self.assertIn("<message>", current,
-                          "После миграции промпт должен содержать '<message>'")
+            self.assertEqual(current, custom_prompt,
+                             "Существующий промпт не должен перезаписываться при init_database")
 
     def test_new_prompt_not_overwritten(self):
         """Если промпт уже новый, миграция не должна его трогать."""

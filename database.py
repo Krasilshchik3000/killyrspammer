@@ -566,6 +566,24 @@ def get_all_admin_decisions(limit=500):
     ) or []
 
 
+def get_correctly_classified_messages(limit=30):
+    """Получить недавние сообщения, где бот и админ согласились.
+
+    Используется для детектора регрессий: новый промпт не должен
+    портить классификацию того, что уже работает.
+    """
+    return execute_query(
+        """SELECT text, llm_result FROM messages
+           WHERE admin_decision IS NOT NULL
+             AND (
+                (llm_result = 'НЕ_СПАМ' AND admin_decision = 'НЕ_СПАМ')
+                OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'СПАМ')
+             )
+           ORDER BY admin_decided_at DESC LIMIT ?""",
+        (limit,), fetch='all'
+    ) or []
+
+
 def get_all_training_examples(text_only=False):
     """Все training examples (для полного аудита).
 

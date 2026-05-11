@@ -34,8 +34,9 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "antispam.db")  # SQLite (локал�
 # Настройки LLM
 # gpt-5.4-nano: самая дешёвая ($0.20/1M), отлично классифицирует спам
 # gpt-5.4-mini: для улучшения промптов (мощнее, $0.75/1M)
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4-nano")
-LLM_IMPROVEMENT_MODEL = os.getenv("LLM_IMPROVEMENT_MODEL", "gpt-5.4-mini")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.5-nano")
+LLM_IMPROVEMENT_MODEL = os.getenv("LLM_IMPROVEMENT_MODEL", "gpt-5.5")
+LLM_VALIDATION_MODEL = os.getenv("LLM_VALIDATION_MODEL", "gpt-5.5-nano")
 LLM_MAX_TOKENS = 150  # Enough for {"result":"...","reasoning":"..."}
 LLM_TEMPERATURE = 0
 LLM_TIMEOUT = 10
@@ -54,13 +55,19 @@ TRUSTED_USER_MESSAGES = int(os.getenv("TRUSTED_USER_MESSAGES", "3"))
 
 # Автоматическое улучшение промпта
 # После скольких ошибок запускать улучшение промпта
-AUTO_IMPROVE_AFTER_ERRORS = int(os.getenv("AUTO_IMPROVE_AFTER_ERRORS", "3"))
+AUTO_IMPROVE_AFTER_ERRORS = int(os.getenv("AUTO_IMPROVE_AFTER_ERRORS", "5"))
 # Минимум примеров для валидации нового промпта
-MIN_VALIDATION_EXAMPLES = int(os.getenv("MIN_VALIDATION_EXAMPLES", "5"))
+MIN_VALIDATION_EXAMPLES = int(os.getenv("MIN_VALIDATION_EXAMPLES", "10"))
 # Максимум примеров для валидации (больше = точнее, но дороже)
-MAX_VALIDATION_EXAMPLES = int(os.getenv("MAX_VALIDATION_EXAMPLES", "30"))
+MAX_VALIDATION_EXAMPLES = int(os.getenv("MAX_VALIDATION_EXAMPLES", "100"))
+# Сколько correctly-classified примеров включать в валидацию (детектор регрессий)
+REGRESSION_CHECK_SAMPLES = int(os.getenv("REGRESSION_CHECK_SAMPLES", "30"))
 # Сколько попыток улучшить промпт за один цикл (каждая — вызов LLM)
 MAX_IMPROVEMENT_ATTEMPTS = int(os.getenv("MAX_IMPROVEMENT_ATTEMPTS", "5"))
+# Минимальный прирост точности для применения нового промпта (5%)
+MIN_ACCURACY_GAIN = float(os.getenv("MIN_ACCURACY_GAIN", "0.05"))
+# Максимум регрессий (раньше правильно → теперь неправильно)
+MAX_REGRESSIONS = int(os.getenv("MAX_REGRESSIONS", "3"))
 
 # Логирование
 LOG_LEVEL = "INFO"

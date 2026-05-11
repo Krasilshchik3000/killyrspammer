@@ -27,11 +27,11 @@ from openai import AsyncOpenAI
 
 from config import (
     BOT_TOKEN, OPENAI_API_KEY, ADMIN_ID, ALLOWED_GROUP_IDS,
-    LLM_MODEL, LLM_IMPROVEMENT_MODEL, LLM_MAX_TOKENS,
+    LLM_MODEL, LLM_IMPROVEMENT_MODEL, LLM_VALIDATION_MODEL, LLM_MAX_TOKENS,
     LLM_TEMPERATURE, LLM_TIMEOUT, MAX_REQUESTS_PER_MINUTE,
     FEW_SHOT_EXAMPLES_COUNT, CAS_API_URL, TRUSTED_USER_MESSAGES,
     AUTO_IMPROVE_AFTER_ERRORS, MIN_VALIDATION_EXAMPLES, MAX_VALIDATION_EXAMPLES,
-    MAX_IMPROVEMENT_ATTEMPTS,
+    MAX_IMPROVEMENT_ATTEMPTS, REGRESSION_CHECK_SAMPLES, MIN_ACCURACY_GAIN, MAX_REGRESSIONS,
 )
 import database as db
 from text_normalize import normalize_text
@@ -537,148 +537,221 @@ async def check_message_with_llm(
 # ──────────────────────────────────────────────
 
 async def evaluate_prompt(prompt_template: str, examples: list) -> tuple[float, int, int, list]:
-    """Оценить промпт на примерах. Возвращает (accuracy, correct, total, errors).
+    """Оценить промпт на примерах параллельно (батчами по 10).
 
     examples: [(text, is_spam), ...]
+    Возвращает (accuracy, correct, total, errors).
     errors: [(text, expected, got), ...] — конкретные ошибочные примеры
     """
     if not examples:
         return 0.0, 0, 0, []
 
-    correct = 0
-    total = len(examples)
-    errors = []
-
-    for text, is_spam in examples:
+    async def classify_one(text: str, is_spam: bool):
         try:
             result, _ = await classify_message(prompt_template, text)
-            # СПАМ или ВОЗМОЖНО_СПАМ считаем за "спам" при is_spam=True
             predicted_spam = result in (SpamResult.SPAM, SpamResult.MAYBE_SPAM)
             actual_spam = bool(is_spam)
-            if predicted_spam == actual_spam:
-                correct += 1
-            else:
-                expected = "SPAM" if actual_spam else "NOT_SPAM"
-                got = "SPAM" if predicted_spam else "NOT_SPAM"
-                errors.append((text[:120], expected, got))
+            return text, is_spam, predicted_spam, actual_spam, None
         except Exception as e:
-            logger.warning(f"Ошибка валидации примера: {e}")
-            total -= 1
+            return text, is_spam, None, None, str(e)
+
+    # Параллельная классификация батчами по 10 (rate limit safety)
+    BATCH = 10
+    results = []
+    for i in range(0, len(examples), BATCH):
+        batch = examples[i:i+BATCH]
+        batch_results = await asyncio.gather(
+            *[classify_one(text, is_spam) for text, is_spam in batch]
+        )
+        results.extend(batch_results)
+
+    correct = 0
+    total = 0
+    errors = []
+    for text, is_spam, predicted_spam, actual_spam, err in results:
+        if err is not None:
+            logger.warning(f"Ошибка валидации примера: {err}")
+            continue
+        total += 1
+        if predicted_spam == actual_spam:
+            correct += 1
+        else:
+            expected = "SPAM" if actual_spam else "NOT_SPAM"
+            got = "SPAM" if predicted_spam else "NOT_SPAM"
+            errors.append((text[:120], expected, got))
 
     accuracy = correct / total if total > 0 else 0.0
     return accuracy, correct, total, errors
 
 
-async def generate_improved_prompt(
-    error_type: str, message_text: str,
-    failed_attempts: list[tuple[str, float | None]] | None = None,
-    validation_errors: list[tuple[str, str, str]] | None = None,
-) -> tuple[str, str] | tuple[None, None]:
-    """Генерирует улучшенный промпт. Возвращает (analysis, improved_prompt) или (None, None).
+# 5 стратегий генерации — каждая попытка использует свою
+IMPROVEMENT_STRATEGIES = [
+    {
+        "name": "обобщение паттернов",
+        "instruction": (
+            "Найди ОБЩИЕ паттерны в ошибках бота. Не вставляй конкретные тексты сообщений. "
+            "Сформулируй универсальные правила-обобщения, описывающие НАМЕРЕНИЕ и СТРУКТУРУ "
+            "спам-сообщений. Например, вместо «сообщения вроде „Купи курс“» пиши «короткие "
+            "рекламные призывы с глаголами действия». Сохрани все существующие правила, добавь новые обобщения."
+        ),
+    },
+    {
+        "name": "упрощение и фокус на intent",
+        "instruction": (
+            "Текущий промпт перегружен. Сократи его, убери дубликаты и избыточные примеры. "
+            "Сфокусируй модель на НАМЕРЕНИИ автора (продажа, вербовка, реклама) "
+            "вместо ключевых слов. Сохрани ключевые категории спама и исключения для NOT_SPAM."
+        ),
+    },
+    {
+        "name": "реструктуризация",
+        "instruction": (
+            "Переструктурируй промпт: чёткие секции SPAM/NOT_SPAM/MAYBE_SPAM с критериями. "
+            "Каждая категория — это описание ТИПА сообщения, а не список конкретных фраз. "
+            "Добавь чёткую логику принятия решения (decision tree)."
+        ),
+    },
+    {
+        "name": "точечное расширение",
+        "instruction": (
+            "Сделай МИНИМАЛЬНОЕ изменение: добавь 1-2 правила, покрывающих новые типы ошибок. "
+            "Не трогай остальное. Новые правила должны быть универсальными (тип/паттерн), "
+            "а не дословными цитатами сообщений."
+        ),
+    },
+    {
+        "name": "полная перезапись с нуля",
+        "instruction": (
+            "Напиши промпт с нуля, учитывая все наблюдения. Структура: цель → категории с "
+            "критериями → исключения → правило при сомнении → защита от prompt injection. "
+            "Категории описывай через ТИПЫ спама (финансовый оффер, реклама канала, "
+            "вербовка в личку, флирт-бот, рекламная картинка), а не примеры."
+        ),
+    },
+]
 
-    failed_attempts: список предыдущих неудачных попыток [(analysis, accuracy), ...]
-    validation_errors: конкретные ошибки текущего промпта [(text, expected, got), ...]
-    """
-    current_prompt = db.get_current_prompt()
+
+def _contains_literal_messages(prompt_text: str, messages: list[str]) -> list[str]:
+    """Возвращает список сообщений из messages, которые буквально (5+ символов подряд)
+    содержатся в prompt_text. Используется для запрета дословного цитирования."""
+    found = []
+    p = prompt_text.lower()
+    for msg in messages:
+        if not msg:
+            continue
+        # Берём фрагменты 25-символьные из сообщения (без пробелов в начале)
+        m = msg.strip().lower()
+        if len(m) < 25:
+            # Короткие — проверяем целиком
+            if m in p and len(m) >= 8:
+                found.append(msg[:60])
+        else:
+            # Длинные — проверяем фрагменты по 25 символов
+            fragments = [m[i:i+25] for i in range(0, len(m) - 25, 15)]
+            for frag in fragments:
+                if frag in p:
+                    found.append(msg[:60])
+                    break
+    return found
+
+
+async def generate_improved_prompt_with_strategy(
+    strategy: dict,
+    current_prompt: str,
+    trigger_message: str,
+    error_type: str,
+    validation_errors: list,
+    failed_attempts: list,
+) -> tuple[str | None, str | None]:
+    """Генерирует промпт с конкретной стратегией. Возвращает (analysis, prompt) или (None, None)."""
 
     descriptions = {
         "missed_spam": "Бот НЕ определил как спам, хотя это спам",
         "uncertain_spam": "Бот определил как ВОЗМОЖНО_СПАМ, но это точно спам",
-        "false_positive": "Бот определил как спам/ВОЗМОЖНО_СПАМ, хотя это НЕ спам (ложное срабатывание)",
+        "false_positive": "Бот определил как спам, хотя это НЕ спам",
+        "manual": "Ручной запуск улучшения",
     }
     description = descriptions.get(error_type, error_type)
 
-    recent_mistakes = db.get_recent_mistakes(5)
-    mistakes_block = ""
-    if recent_mistakes:
-        lines = ["Другие недавние ошибки бота:"]
-        for text, bot_dec, admin_dec, _ in recent_mistakes:
-            lines.append(f"  - «{text[:80]}» — бот: {bot_dec}, правильно: {admin_dec}")
-        mistakes_block = "\n".join(lines)
+    # Конкретные ошибки на валидации (только text-spam)
+    errors_block = ""
+    if validation_errors:
+        lines = ["ОШИБКИ ТЕКУЩЕГО ПРОМПТА (для понимания, не цитировать в промпте):"]
+        for text, expected, got in validation_errors[:15]:
+            lines.append(f"  - «{text[:120]}» — ожидалось: {expected}, бот: {got}")
+        errors_block = "\n".join(lines)
 
-    # Контекст предыдущих неудачных попыток
+    # Что не сработало в предыдущих попытках
     failed_block = ""
     if failed_attempts:
-        lines = ["ПРЕДЫДУЩИЕ НЕУДАЧНЫЕ ПОПЫТКИ (не повторяй те же подходы!):"]
-        for i, (reason, acc) in enumerate(failed_attempts):
+        lines = ["ПРЕДЫДУЩИЕ ПОПЫТКИ (не повторяй):"]
+        for i, (strat_name, acc, reason) in enumerate(failed_attempts):
             acc_str = f"{acc:.0%}" if acc is not None else "❌"
-            lines.append(f"  Попытка {i+1} (точность: {acc_str}): {reason[:150]}")
-        lines.append("")
-        lines.append("Каждая новая попытка ДОЛЖНА использовать существенно другой подход.")
+            lines.append(f"  #{i+1} «{strat_name}» — {acc_str}: {reason[:120]}")
         failed_block = "\n".join(lines)
 
-    # Блок конкретных ошибок текущего промпта на валидации
-    validation_errors_block = ""
-    if validation_errors:
-        lines = ["КОНКРЕТНЫЕ ОШИБКИ ТЕКУЩЕГО ПРОМПТА НА ВАЛИДАЦИИ:"]
-        for text, expected, got in validation_errors[:10]:
-            lines.append(f"  - «{text}» — ожидалось: {expected}, бот сказал: {got}")
-        validation_errors_block = "\n".join(lines)
+    analysis_prompt = f"""Ты эксперт по антиспам-системам Telegram.
 
-    analysis_prompt = f"""Ты эксперт по созданию промптов для определения спама в Telegram-группах.
-
-ТЕКУЩИЙ ПРОМПТ (используется для классификации сообщений):
+ТЕКУЩИЙ ПРОМПТ:
 ---
 {current_prompt}
 ---
 
-ОШИБКА КЛАССИФИКАЦИИ: {description}
-Проблемное сообщение: "{message_text}"
+КОНТЕКСТ: {description}. Сообщение-триггер: «{trigger_message[:200]}»
 
-{validation_errors_block}
-
-{mistakes_block}
+{errors_block}
 
 {failed_block}
 
-ЗАДАЧА: Улучши промпт так, чтобы он правильно обрабатывал это и похожие сообщения.
+СТРАТЕГИЯ ЭТОЙ ПОПЫТКИ: {strategy['name']}
+{strategy['instruction']}
 
-ПРАВИЛА:
-1. Сохрани ВСЕ существующие критерии, исключения и структуру. Только дополни/уточни.
-2. Промпт ОБЯЗАН содержать {{{{few_shot_block}}}} для вставки примеров.
-3. Промпт ОБЯЗАН содержать три варианта: SPAM, NOT_SPAM, MAYBE_SPAM.
-4. Промпт используется как system prompt. Сообщение пользователя передаётся отдельно в теге <message>.
-5. Если ошибка — ложное срабатывание, добавь исключение чтобы подобные сообщения НЕ считались спамом.
+ОБЯЗАТЕЛЬНЫЕ ТРЕБОВАНИЯ К НОВОМУ ПРОМПТУ:
+- Содержит три категории: SPAM, NOT_SPAM, MAYBE_SPAM
+- Содержит плейсхолдер {{{{few_shot_block}}}} для подстановки примеров
+- Используется как system prompt; сообщение пользователя приходит отдельно в теге <message>
+- Описывает ТИПЫ спама и КРИТЕРИИ их определения (это нужно и важно!)
+- ЗАПРЕЩЕНО: вставлять дословные цитаты конкретных сообщений из ошибок выше
+- ЗАПРЕЩЕНО: упоминать конкретные @username из реальных сообщений
+- РАЗРЕШЕНО и нужно: описывать паттерны, структуру, намерение, эмодзи-стиль
 
-Ответь СТРОГО в формате (два блока, разделённых маркером):
+Ответь СТРОГО в формате:
 
-АНАЛИЗ: причина ошибки в 1-2 предложениях
+АНАЛИЗ: 2-3 предложения о том, что меняется в этой попытке
 
 ИТОГОВЫЙ_ПРОМПТ:
-полный улучшенный промпт здесь"""
+<полный текст нового промпта>"""
 
     try:
         response = await openai_client.chat.completions.create(
             model=LLM_IMPROVEMENT_MODEL,
             messages=[
-                {"role": "system", "content": "Ты помощник по улучшению промптов. Всегда отвечай строго в указанном формате с маркерами АНАЛИЗ: и ИТОГОВЫЙ_ПРОМПТ:"},
+                {"role": "system", "content": (
+                    "Ты эксперт по промпт-инжинирингу для антиспам-систем. "
+                    "Формат ответа: АНАЛИЗ: ... ИТОГОВЫЙ_ПРОМПТ: <текст>"
+                )},
                 {"role": "user", "content": analysis_prompt},
             ],
             **_token_limit_param_improvement(16000),
-            temperature=0.3,
-            timeout=90,
+            temperature=0.5,  # Чуть выше для разнообразия стратегий
+            timeout=180,
         )
         text = (response.choices[0].message.content or "").strip()
         finish = response.choices[0].finish_reason
-        logger.info(f"LLM improvement: len={len(text)}, finish={finish}, has_marker={'ИТОГОВЫЙ_ПРОМПТ:' in text}")
+        logger.info(f"LLM gen ({strategy['name']}): len={len(text)}, finish={finish}")
         if not text:
-            logger.warning("LLM вернул пустой ответ")
             return None, None
 
-        # Ищем маркер (с возможными вариациями форматирования)
+        # Парсим маркер
         marker = None
         for m in ["ИТОГОВЫЙ_ПРОМПТ:", "ИТОГОВЫЙ ПРОМПТ:", "**ИТОГОВЫЙ_ПРОМПТ:**", "**ИТОГОВЫЙ_ПРОМПТ**:"]:
             if m in text:
                 marker = m
                 break
-
         if not marker:
-            logger.warning(f"Маркер ИТОГОВЫЙ_ПРОМПТ не найден в ответе LLM (первые 200 символов): {text[:200]}")
             return text, None
 
         improved = text.split(marker, 1)[1].strip()
-
-        # Убираем возможные markdown-обёртки
         if improved.startswith("```"):
             improved = improved.split("```", 2)[1]
             if improved.startswith("\n"):
@@ -687,14 +760,13 @@ async def generate_improved_prompt(
                 improved = improved.rsplit("```", 1)[0]
             improved = improved.strip()
 
-        # Патчим если потеряны обязательные элементы
-        if "{message_text}" not in improved:
-            improved += "\n\nСообщение: «{message_text}»\n\nОтвет:"
+        # Патчим обязательные плейсхолдеры
+        if "{message_text}" not in improved and "<message>" not in improved:
+            improved += "\n\nСообщение: «{message_text}»"
         if "{few_shot_block}" not in improved:
-            improved = improved.replace("Сообщение: «{message_text}»", "{few_shot_block}\nСообщение: «{message_text}»")
+            improved += "\n\n{few_shot_block}"
 
         analysis = text.split(marker)[0].strip()
-        # Убираем маркер АНАЛИЗ: из начала
         if analysis.startswith("АНАЛИЗ:"):
             analysis = analysis[7:].strip()
         elif analysis.startswith("**АНАЛИЗ:**"):
@@ -703,17 +775,43 @@ async def generate_improved_prompt(
         return analysis, improved
 
     except Exception as e:
-        logger.error(f"Ошибка генерации промпта: {e}", exc_info=True)
+        logger.error(f"Ошибка генерации ({strategy['name']}): {e}")
         return None, None
 
 
-async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
-    """Итеративное улучшение промпта с валидацией.
+async def _send_progress(text: str):
+    """Отправляет прогресс-сообщение админу. Не падает при ошибке."""
+    try:
+        await bot.send_message(ADMIN_ID, text, parse_mode='HTML')
+    except Exception:
+        try:
+            await bot.send_message(ADMIN_ID, text)  # без HTML
+        except Exception as e:
+            logger.warning(f"Не удалось отправить прогресс: {e}")
 
-    Цикл до MAX_IMPROVEMENT_ATTEMPTS попыток:
-    1. Генерирует улучшенный промпт (с контекстом предыдущих неудач)
-    2. Оценивает текущий и новый на validation set
-    3. Если лучше — применяет. Если нет — пробует снова с анализом неудачи.
+
+async def _send_full_prompt(prompt_text: str, label: str = "📝 <b>ПОЛНЫЙ ПРОМПТ</b>"):
+    """Отправляет промпт целиком, разбивая на чанки по 3700 символов."""
+    escaped = html.escape(prompt_text)
+    if len(escaped) <= 3600:
+        await _send_progress(f"{label}\n\n<code>{escaped}</code>")
+        return
+    chunks = [escaped[i:i+3600] for i in range(0, len(escaped), 3600)]
+    total = len(chunks)
+    for i, chunk in enumerate(chunks):
+        h = f"{label} (часть {i+1}/{total})" if total > 1 else label
+        await _send_progress(f"{h}\n\n<code>{chunk}</code>")
+
+
+async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
+    """Многостратегическое автоулучшение промпта с прогресс-репортингом и валидацией на полной базе.
+
+    Алгоритм:
+    1. Собираем полный датасет: text-spam примеры + correctly-classified сообщения (детектор регрессий)
+    2. Оцениваем текущий промпт
+    3. Для каждой из 5 стратегий: генерируем → валидируем → сравниваем
+    4. Выбираем лучшую попытку с учётом точности, регрессий, FP/FN
+    5. Применяем, если выполнены критерии; иначе отчитываемся
     """
     global _improvement_in_progress
     if _improvement_in_progress:
@@ -721,90 +819,202 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
     _improvement_in_progress = True
 
     try:
-        examples_count = db.count_training_examples()
-        has_enough_for_validation = examples_count >= MIN_VALIDATION_EXAMPLES
+        # ── Фаза 1: Сбор контекста ──
+        await _send_progress(f"🔄 <b>Запуск автообучения</b>\nТриггер: {html.escape(trigger_error_type)}")
 
-        # Оцениваем текущий промпт один раз (для всех попыток)
         current_prompt = db.get_current_prompt()
-        current_acc, current_ok, current_total, current_errors = 0.0, 0, 0, []
-        validation_examples = []
+        spam_examples = db.get_validation_examples(MAX_VALIDATION_EXAMPLES)  # уже фильтр по text-spam
+        correct_messages = db.get_correctly_classified_messages(REGRESSION_CHECK_SAMPLES)
 
-        if has_enough_for_validation:
-            validation_examples = db.get_validation_examples(MAX_VALIDATION_EXAMPLES)
-            current_acc, current_ok, current_total, current_errors = await evaluate_prompt(current_prompt, validation_examples)
-            logger.info(f"Текущая точность: {current_acc:.0%} ({current_ok}/{current_total}), ошибок: {len(current_errors)}")
+        # Формируем датасет для регрессий: (text, is_spam)
+        regression_set = []
+        for text, llm_result in correct_messages:
+            is_spam = llm_result in ('СПАМ', 'ВОЗМОЖНО_СПАМ')
+            regression_set.append((text, is_spam))
 
-        # Цикл попыток улучшения
-        failed_attempts = []  # [(analysis, accuracy), ...]
-
-        for attempt in range(1, MAX_IMPROVEMENT_ATTEMPTS + 1):
-            logger.info(f"Попытка улучшения {attempt}/{MAX_IMPROVEMENT_ATTEMPTS}")
-
-            # Генерируем с контекстом предыдущих неудач и конкретных ошибок
-            analysis, improved = await generate_improved_prompt(
-                trigger_error_type, trigger_message, failed_attempts, current_errors
+        total_eval = len(spam_examples) + len(regression_set)
+        if total_eval < MIN_VALIDATION_EXAMPLES:
+            await _send_progress(
+                f"⚠️ Мало данных для валидации: {total_eval} (минимум {MIN_VALIDATION_EXAMPLES}). "
+                f"Автообучение отложено."
             )
+            return
+
+        await _send_progress(
+            f"📊 <b>Датасет</b>\n"
+            f"  • Text-spam примеров: {len(spam_examples)}\n"
+            f"  • Correctly-classified (детектор регрессий): {len(regression_set)}\n"
+            f"  • Всего для валидации: {total_eval}"
+        )
+
+        # ── Фаза 2: Оценка текущего промпта ──
+        await _send_progress(f"🔍 Оцениваю текущий промпт на {total_eval} примерах...")
+        full_eval_set = spam_examples + regression_set
+        current_acc, current_ok, current_total, current_errors = await evaluate_prompt(current_prompt, full_eval_set)
+
+        # Запоминаем что бот сейчас правильно классифицирует — для детектора регрессий
+        current_correct_set = set()
+        for text, is_spam in full_eval_set:
+            is_in_errors = any(e[0] == text[:120] for e in current_errors)
+            if not is_in_errors:
+                current_correct_set.add(text)
+
+        await _send_progress(
+            f"📈 <b>Текущая точность:</b> {current_acc:.0%} ({current_ok}/{current_total})\n"
+            f"Ошибок: {len(current_errors)}"
+        )
+
+        # ── Фаза 3: Многостратегическая генерация ──
+        candidates = []  # [(strategy_name, prompt, analysis, accuracy, regressions, fp, fn)]
+        failed_attempts = []  # для контекста следующих попыток
+
+        # Названия сообщений-триггеров для проверки literal containment
+        trigger_texts = [trigger_message] + [e[0] for e in current_errors[:10]]
+
+        for i, strategy in enumerate(IMPROVEMENT_STRATEGIES, 1):
+            await _send_progress(f"🧠 <b>Попытка {i}/{len(IMPROVEMENT_STRATEGIES)}</b>: стратегия «{strategy['name']}»")
+
+            analysis, improved = await generate_improved_prompt_with_strategy(
+                strategy, current_prompt, trigger_message, trigger_error_type,
+                current_errors, failed_attempts
+            )
+
             if not improved:
-                detail = f"\nАнализ LLM: {analysis[:300]}" if analysis else "\nLLM не вернул ответ"
-                failed_attempts.append((detail, None))
-                logger.warning(f"Попытка {attempt}: генерация не удалась")
+                msg = "LLM не вернул промпт"
+                failed_attempts.append((strategy['name'], None, msg))
+                await _send_progress(f"❌ Попытка {i}: {msg}")
                 continue
 
+            # Валидация структуры
             problems = validate_prompt(improved)
             if problems:
-                failed_attempts.append((f"Невалидный промпт: {', '.join(problems)}", None))
-                logger.warning(f"Попытка {attempt}: промпт невалиден: {problems}")
+                msg = f"невалидный: {', '.join(problems)}"
+                failed_attempts.append((strategy['name'], None, msg))
+                await _send_progress(f"❌ Попытка {i}: {html.escape(msg)}")
                 continue
 
-            if not has_enough_for_validation:
-                # Мало примеров — применяем первый валидный промпт
-                db.save_prompt_version(improved, f"Авто (без валидации, {examples_count} примеров): {trigger_error_type}")
-                report = (
-                    f"✅ <b>Промпт обновлён</b> (мало данных для валидации: {examples_count}/{MIN_VALIDATION_EXAMPLES})\n\n"
-                    f"Причина: {html.escape(analysis or '')}\n\n"
-                    f"Откатить: /rollback (из /history)"
-                )
-                await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
-                return
+            # Проверка: не содержит ли дословных цитат сообщений
+            literal_quotes = _contains_literal_messages(improved, trigger_texts)
+            if literal_quotes:
+                msg = f"содержит дословные цитаты ({len(literal_quotes)}): {literal_quotes[0]}"
+                failed_attempts.append((strategy['name'], None, msg))
+                await _send_progress(f"❌ Попытка {i}: {html.escape(msg)}")
+                continue
 
-            # Валидация
-            new_acc, new_ok, new_total, _ = await evaluate_prompt(improved, validation_examples)
-            logger.info(f"Попытка {attempt}: {new_acc:.0%} ({new_ok}/{new_total}) vs текущий {current_acc:.0%}")
+            await _send_progress(f"✓ Попытка {i}: промпт сгенерирован ({len(improved)} симв). Валидирую...")
 
-            if new_acc > current_acc:
-                # Успех! Применяем
-                db.save_prompt_version(improved, f"Авто: {trigger_error_type} ({new_acc:.0%} vs {current_acc:.0%}, попытка {attempt})")
-                report = (
-                    f"✅ <b>Промпт автоматически обновлён</b>\n\n"
-                    f"Было: {current_acc:.0%} ({current_ok}/{current_total})\n"
-                    f"Стало: {new_acc:.0%} ({new_ok}/{new_total})\n"
-                    f"Попыток: {attempt}/{MAX_IMPROVEMENT_ATTEMPTS}\n\n"
-                    f"Причина: {html.escape(analysis or '')}\n\n"
-                    f"<code>{html.escape(improved[:500])}{'...' if len(improved) > 500 else ''}</code>\n\n"
-                    f"Откатить: /rollback (из /history)"
-                )
-                await bot.send_message(ADMIN_ID, report, parse_mode='HTML')
-                return
+            # Полная валидация
+            new_acc, new_ok, new_total, new_errors = await evaluate_prompt(improved, full_eval_set)
 
-            # Не лучше — запоминаем и пробуем снова
-            failed_attempts.append((analysis, new_acc))
-            logger.info(f"Попытка {attempt}: не лучше ({new_acc:.0%} <= {current_acc:.0%}), продолжаем...")
+            # Считаем регрессии: было правильно — стало неправильно
+            regressions = 0
+            for err_text, _, _ in new_errors:
+                # err_text это первые 120 символов из evaluate_prompt
+                for orig_text in current_correct_set:
+                    if orig_text[:120] == err_text:
+                        regressions += 1
+                        break
 
-        # Все попытки исчерпаны — короткий отчёт
-        best_attempt_acc = max((acc for _, acc in failed_attempts if acc is not None), default=0)
-        errors_summary = ""
-        if current_errors:
-            error_examples = [f"«{t[:60]}»" for t, _, _ in current_errors[:3]]
-            errors_summary = f"\nОшибается на: {', '.join(error_examples)}"
-        report = (
-            f"🔄 Промпт не улучшен (5 попыток, лучшая: {best_attempt_acc:.0%} vs текущая: {current_acc:.0%}). "
-            f"Few-shot примеры учтены.{errors_summary}"
-        )
-        await bot.send_message(ADMIN_ID, report)
+            # FP/FN считаем на spam_examples (где известна метка)
+            fp, fn = 0, 0
+            for err_text, expected, got in new_errors:
+                if expected == "SPAM" and got == "NOT_SPAM":
+                    fn += 1
+                elif expected == "NOT_SPAM" and got == "SPAM":
+                    fp += 1
+
+            verdict_emoji = "✅" if new_acc > current_acc else "🔄"
+            await _send_progress(
+                f"{verdict_emoji} <b>Попытка {i} результат:</b>\n"
+                f"  Точность: {new_acc:.0%} (было {current_acc:.0%})\n"
+                f"  Регрессий: {regressions} | FP: {fp} | FN: {fn}"
+            )
+
+            candidates.append({
+                "strategy": strategy['name'],
+                "prompt": improved,
+                "analysis": analysis or "",
+                "accuracy": new_acc,
+                "ok": new_ok,
+                "total": new_total,
+                "regressions": regressions,
+                "fp": fp,
+                "fn": fn,
+                "attempt": i,
+            })
+
+            # Запомним для следующих попыток
+            failed_attempts.append((strategy['name'], new_acc, analysis[:120] if analysis else ""))
+
+        # ── Фаза 4: Выбор лучшего ──
+        if not candidates:
+            await _send_progress(
+                "❌ <b>Ни одна попытка не дала валидный промпт.</b>\n"
+                "Промпт не изменён."
+            )
+            return
+
+        # Сортируем кандидатов: сначала по приросту точности, потом по минимуму регрессий
+        candidates.sort(key=lambda c: (c["accuracy"], -c["regressions"]), reverse=True)
+        best = candidates[0]
+
+        # Критерии применения
+        accuracy_gain = best["accuracy"] - current_acc
+        meets_gain = accuracy_gain >= MIN_ACCURACY_GAIN
+        meets_regression = best["regressions"] <= MAX_REGRESSIONS
+        # Если текущая точность критически низкая — мягче критерии
+        critical_low = current_acc < 0.5
+
+        should_apply = False
+        reason = ""
+        if meets_gain and meets_regression:
+            should_apply = True
+            reason = f"Прирост точности {accuracy_gain:+.0%}, регрессий {best['regressions']} (≤{MAX_REGRESSIONS})"
+        elif critical_low and best["accuracy"] > current_acc:
+            should_apply = True
+            reason = f"Текущая точность критически низкая ({current_acc:.0%}), применяю лучший вариант"
+        else:
+            if not meets_gain:
+                reason = f"Прирост {accuracy_gain:+.0%} меньше порога {MIN_ACCURACY_GAIN:.0%}"
+            elif not meets_regression:
+                reason = f"Регрессий {best['regressions']} больше порога {MAX_REGRESSIONS}"
+
+        # Сводка по всем кандидатам
+        summary_lines = ["📋 <b>Все попытки:</b>"]
+        for c in candidates:
+            mark = "🏆" if c is best else "•"
+            summary_lines.append(
+                f"  {mark} #{c['attempt']} «{c['strategy']}»: {c['accuracy']:.0%}, "
+                f"рег={c['regressions']}, FP={c['fp']}, FN={c['fn']}"
+            )
+        await _send_progress("\n".join(summary_lines))
+
+        if should_apply:
+            db.save_prompt_version(
+                best["prompt"],
+                f"Авто ({best['strategy']}): {best['accuracy']:.0%} vs {current_acc:.0%}, рег={best['regressions']}"
+            )
+            await _send_progress(
+                f"✅ <b>Промпт обновлён</b>\n"
+                f"Стратегия: «{best['strategy']}»\n"
+                f"Точность: {current_acc:.0%} → {best['accuracy']:.0%}\n"
+                f"Регрессий: {best['regressions']}\n"
+                f"Причина применения: {reason}\n\n"
+                f"<b>Анализ:</b> {html.escape(best['analysis'][:400])}\n\n"
+                f"Откатить: /rollback (см. /history)"
+            )
+            await _send_full_prompt(best["prompt"], "📝 <b>ФИНАЛЬНЫЙ ПРОМПТ</b>")
+        else:
+            await _send_progress(
+                f"🔄 <b>Промпт НЕ обновлён</b>\n"
+                f"Лучший кандидат: «{best['strategy']}» — {best['accuracy']:.0%} (текущий {current_acc:.0%})\n"
+                f"Причина: {reason}\n\n"
+                f"Текущий промпт остаётся в силе. Few-shot примеры продолжают учитывать ошибки."
+            )
 
     except Exception as e:
-        logger.error(f"Ошибка автоулучшения: {e}")
-        await bot.send_message(ADMIN_ID, f"⚠️ Ошибка автоулучшения промпта: {e}")
+        logger.error(f"Ошибка автообучения: {e}", exc_info=True)
+        await _send_progress(f"⚠️ Ошибка автообучения: {html.escape(str(e))}")
     finally:
         _improvement_in_progress = False
 
