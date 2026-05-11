@@ -568,9 +568,11 @@ async def evaluate_prompt(prompt_template: str, examples: list) -> tuple[float, 
     correct = 0
     total = 0
     errors = []
+    eval_errors_sample = []  # для логгирования
     for text, is_spam, predicted_spam, actual_spam, err in results:
         if err is not None:
-            logger.warning(f"Ошибка валидации примера: {err}")
+            if len(eval_errors_sample) < 3:
+                eval_errors_sample.append(err)
             continue
         total += 1
         if predicted_spam == actual_spam:
@@ -579,6 +581,9 @@ async def evaluate_prompt(prompt_template: str, examples: list) -> tuple[float, 
             expected = "SPAM" if actual_spam else "NOT_SPAM"
             got = "SPAM" if predicted_spam else "NOT_SPAM"
             errors.append((text[:120], expected, got))
+
+    if eval_errors_sample:
+        logger.error(f"evaluate_prompt: {len(examples) - total - len(errors)} примеров упали с ошибкой. Примеры: {eval_errors_sample}")
 
     accuracy = correct / total if total > 0 else 0.0
     return accuracy, correct, total, errors
@@ -775,8 +780,8 @@ async def generate_improved_prompt_with_strategy(
         return analysis, improved
 
     except Exception as e:
-        logger.error(f"Ошибка генерации ({strategy['name']}): {e}")
-        return None, None
+        logger.error(f"Ошибка генерации ({strategy['name']}): {e}", exc_info=True)
+        return f"Ошибка LLM: {str(e)[:200]}", None
 
 
 async def _send_progress(text: str):
@@ -852,6 +857,13 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
         full_eval_set = spam_examples + regression_set
         current_acc, current_ok, current_total, current_errors = await evaluate_prompt(current_prompt, full_eval_set)
 
+        if current_total == 0:
+            await _send_progress(
+                f"❌ <b>Валидация невозможна</b>: все {total_eval} примеров упали с ошибкой LLM.\n"
+                f"Скорее всего проблема с моделью {LLM_MODEL}. Проверьте логи Railway."
+            )
+            return
+
         # Запоминаем что бот сейчас правильно классифицирует — для детектора регрессий
         current_correct_set = set()
         for text, is_spam in full_eval_set:
@@ -880,9 +892,9 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
             )
 
             if not improved:
-                msg = "LLM не вернул промпт"
+                msg = f"LLM не вернул промпт ({analysis[:120] if analysis else 'нет ответа'})"
                 failed_attempts.append((strategy['name'], None, msg))
-                await _send_progress(f"❌ Попытка {i}: {msg}")
+                await _send_progress(f"❌ Попытка {i}: {html.escape(msg)}")
                 continue
 
             # Валидация структуры
