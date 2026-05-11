@@ -870,9 +870,17 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
         current_acc, current_ok, current_total, current_errors = await evaluate_prompt(current_prompt, full_eval_set)
 
         if current_total == 0:
+            # Сделаем один прямой тест чтобы увидеть точную ошибку
+            test_err = "неизвестная ошибка"
+            try:
+                test_text = full_eval_set[0][0] if full_eval_set else "тест"
+                await classify_message(current_prompt, test_text)
+            except Exception as e:
+                test_err = f"{type(e).__name__}: {str(e)[:300]}"
             await _send_progress(
-                f"❌ <b>Валидация невозможна</b>: все {total_eval} примеров упали с ошибкой LLM.\n"
-                f"Скорее всего проблема с моделью {LLM_MODEL}. Проверьте логи Railway."
+                f"❌ <b>Валидация невозможна</b>: все {total_eval} примеров упали.\n"
+                f"Модель: <code>{html.escape(LLM_MODEL)}</code>\n"
+                f"Ошибка: <code>{html.escape(test_err)}</code>"
             )
             return
 
@@ -1949,6 +1957,19 @@ async def main():
         f"| model={LLM_MODEL} | improve={LLM_IMPROVEMENT_MODEL} "
         f"| auto_improve_after={AUTO_IMPROVE_AFTER_ERRORS} errors"
     )
+
+    # Самотест модели — пробуем классифицировать одно сообщение
+    try:
+        test_result, _ = await classify_message(db.get_current_prompt(), "тест классификации")
+        logger.info(f"✅ Модель {LLM_MODEL} работает (тестовое сообщение → {test_result.value})")
+    except Exception as e:
+        err_msg = f"❌ Модель {LLM_MODEL} не работает: {type(e).__name__}: {str(e)[:300]}"
+        logger.error(err_msg)
+        try:
+            await bot.send_message(ADMIN_ID, err_msg)
+        except Exception:
+            pass
+
     # Запускаем еженедельный аудит в фоне
     asyncio.create_task(_weekly_audit_loop())
     logger.info("📅 Еженедельный аудит запланирован")
