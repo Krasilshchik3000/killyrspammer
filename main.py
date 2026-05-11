@@ -942,12 +942,20 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
             )
             return
 
+        # Считаем разбивку для прозрачности
+        spam_count = sum(1 for _, is_s in spam_examples if is_s)
+        notspam_count = len(spam_examples) - spam_count
+        reg_spam = sum(1 for _, is_s in regression_set if is_s)
+        reg_notspam = len(regression_set) - reg_spam
+
         await _send_progress(
-            f"📊 <b>Датасет валидации</b>\n"
-            f"  • Text-spam примеров: {len(spam_examples)}\n"
-            f"  • Спорные правильно-классифицированные: {len(regression_set)}\n"
-            f"  • Обычные сообщения (не вызывавшие подозрений): {len(ordinary_set)}\n"
-            f"  • Всего: {total_eval}"
+            f"📊 <b>Датасет валидации</b> (все доступные данные)\n"
+            f"  • Training examples: {len(spam_examples)} "
+            f"(спам: {spam_count}, не-спам: {notspam_count})\n"
+            f"  • Прошедшие ревью админа: {len(regression_set)} "
+            f"(спам: {reg_spam}, не-спам: {reg_notspam})\n"
+            f"  • Обычные сообщения (без ревью): {len(ordinary_set)}\n"
+            f"  • <b>Всего: {total_eval}</b>"
         )
 
         # Анализ спам-волн (паттерны у недавних забаненных)
