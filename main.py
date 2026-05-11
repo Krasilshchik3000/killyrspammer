@@ -31,7 +31,8 @@ from config import (
     LLM_MAX_TOKENS, LLM_TEMPERATURE, LLM_TIMEOUT, MAX_REQUESTS_PER_MINUTE,
     FEW_SHOT_EXAMPLES_COUNT, CAS_API_URL, TRUSTED_USER_MESSAGES,
     AUTO_IMPROVE_AFTER_ERRORS, MIN_VALIDATION_EXAMPLES, MAX_VALIDATION_EXAMPLES,
-    MAX_IMPROVEMENT_ATTEMPTS, REGRESSION_CHECK_SAMPLES, MIN_ACCURACY_GAIN, MAX_REGRESSIONS,
+    MAX_IMPROVEMENT_ATTEMPTS, REGRESSION_CHECK_SAMPLES, ORDINARY_MESSAGES_SAMPLES,
+    MIN_ACCURACY_GAIN, MAX_REGRESSIONS,
 )
 from config import LLM_MODEL as _ENV_LLM_MODEL
 from config import LLM_IMPROVEMENT_MODEL as _ENV_LLM_IMPROVEMENT_MODEL
@@ -746,6 +747,7 @@ async def generate_improved_prompt_with_strategy(
     error_type: str,
     validation_errors: list,
     failed_attempts: list,
+    wave_analysis: str = "",
 ) -> tuple[str | None, str | None]:
     """Генерирует промпт с конкретной стратегией. Возвращает (analysis, prompt) или (None, None)."""
 
@@ -754,6 +756,7 @@ async def generate_improved_prompt_with_strategy(
         "uncertain_spam": "Бот определил как ВОЗМОЖНО_СПАМ, но это точно спам",
         "false_positive": "Бот определил как спам, хотя это НЕ спам",
         "manual": "Ручной запуск улучшения",
+        "weekly": "Еженедельное обучение на полной базе",
     }
     description = descriptions.get(error_type, error_type)
 
@@ -774,6 +777,10 @@ async def generate_improved_prompt_with_strategy(
             lines.append(f"  #{i+1} «{strat_name}» — {acc_str}: {reason[:120]}")
         failed_block = "\n".join(lines)
 
+    waves_block = ""
+    if wave_analysis:
+        waves_block = f"АКТУАЛЬНЫЕ СПАМ-ВОЛНЫ (из недавних банов):\n{wave_analysis}"
+
     analysis_prompt = f"""Ты эксперт по антиспам-системам Telegram.
 
 ТЕКУЩИЙ ПРОМПТ:
@@ -784,6 +791,8 @@ async def generate_improved_prompt_with_strategy(
 КОНТЕКСТ: {description}. Сообщение-триггер: «{trigger_message[:200]}»
 
 {errors_block}
+
+{waves_block}
 
 {failed_block}
 
@@ -909,7 +918,7 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
         current_prompt = db.get_current_prompt()
         spam_examples = db.get_validation_examples(MAX_VALIDATION_EXAMPLES)  # уже фильтр по text-spam
         correct_messages = db.get_correctly_classified_messages(REGRESSION_CHECK_SAMPLES)
-        ordinary_messages = db.get_ordinary_messages(REGRESSION_CHECK_SAMPLES)
+        ordinary_messages = db.get_ordinary_messages(ORDINARY_MESSAGES_SAMPLES)
 
         # Формируем датасет: спам + correctly-classified + обычные сообщения
         # is_spam=False для обычных (они НЕ должны флагаться как спам)
@@ -935,6 +944,20 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
             f"  • Обычные сообщения (не вызывавшие подозрений): {len(ordinary_set)}\n"
             f"  • Всего: {total_eval}"
         )
+
+        # Анализ спам-волн (паттерны у недавних забаненных)
+        wave_analysis = ""
+        try:
+            banned_profiles = db.get_recent_banned_profiles(168)  # 7 дней
+            if banned_profiles:
+                wave_analysis = await detect_spam_waves(banned_profiles)
+                if wave_analysis:
+                    await _send_progress(
+                        f"🌊 <b>Обнаружены спам-волны</b> (за 7 дней, {len(banned_profiles)} забаненных)\n"
+                        f"{html.escape(wave_analysis[:600])}"
+                    )
+        except Exception as e:
+            logger.warning(f"Ошибка анализа спам-волн: {e}")
 
         # ── Фаза 2: Оценка текущего промпта ──
         await _send_progress(f"🔍 Оцениваю текущий промпт на {total_eval} примерах...")
@@ -980,7 +1003,7 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
 
             analysis, improved = await generate_improved_prompt_with_strategy(
                 strategy, current_prompt, trigger_message, trigger_error_type,
-                current_errors, failed_attempts
+                current_errors, failed_attempts, wave_analysis
             )
 
             if not improved:
@@ -1135,233 +1158,6 @@ async def maybe_trigger_improvement(error_type: str, message_text: str):
 
 # ──────────────────────────────────────────────
 # Telegram: проверки и действия
-# ──────────────────────────────────────────────
-# Полный аудит промпта + детектор спам-волн
-# ──────────────────────────────────────────────
-
-async def run_full_audit():
-    """Полный аудит: анализ всех данных, поиск паттернов, улучшение промпта."""
-    try:
-        await bot.send_message(ADMIN_ID, "🔍 Начинаю полный аудит промпта...")
-
-        # 1. Собираем все данные
-        all_decisions = db.get_all_admin_decisions(500)
-        all_examples = db.get_all_training_examples()
-        current_prompt = db.get_current_prompt()
-        banned_profiles = db.get_recent_banned_profiles(168)  # 7 дней
-
-        # 2. Формируем статистику
-        stats = {
-            "total_decisions": len(all_decisions),
-            "total_examples": len(all_examples),
-            "banned_profiles": len(banned_profiles),
-        }
-
-        # Считаем ошибки по типам
-        false_positives = []  # бот сказал спам, админ — нет
-        missed_spam = []  # бот сказал не спам, админ — спам
-        correct = 0
-        for text, llm_result, admin_decision, reasoning, _ in all_decisions:
-            llm_spam = llm_result in ('СПАМ', 'ВОЗМОЖНО_СПАМ')
-            admin_spam = admin_decision == 'СПАМ'
-            if llm_spam == admin_spam:
-                correct += 1
-            elif llm_spam and not admin_spam:
-                false_positives.append((text[:100], reasoning or ''))
-            elif not llm_spam and admin_spam:
-                missed_spam.append((text[:100], reasoning or ''))
-
-        accuracy = correct / len(all_decisions) if all_decisions else 0
-
-        # 3. Анализ спам-волн
-        wave_analysis = await detect_spam_waves(banned_profiles)
-
-        # 4. Отправляем всё в LLM для глубокого анализа и генерации нового промпта
-        fp_block = "\n".join(f"  - «{t}» (бот думал: {r[:60]})" for t, r in false_positives[:15])
-        ms_block = "\n".join(f"  - «{t}» (бот думал: {r[:60]})" for t, r in missed_spam[:15])
-
-        audit_prompt = f"""Ты эксперт по антиспам-системам в Telegram. Проведи полный аудит промпта.
-
-ТЕКУЩИЙ ПРОМПТ:
----
-{current_prompt}
----
-
-СТАТИСТИКА:
-- Всего решений админа: {stats['total_decisions']}
-- Точность бота: {accuracy:.0%} ({correct}/{len(all_decisions)})
-- Ложные срабатывания (бот думал спам, а это не спам): {len(false_positives)}
-- Пропущенный спам (бот думал не спам, а это спам): {len(missed_spam)}
-- Забаненных за 7 дней: {stats['banned_profiles']}
-
-ЛОЖНЫЕ СРАБАТЫВАНИЯ:
-{fp_block or '  (нет)'}
-
-ПРОПУЩЕННЫЙ СПАМ:
-{ms_block or '  (нет)'}
-
-ОБНАРУЖЕННЫЕ ПАТТЕРНЫ СПАМ-ВОЛН:
-{wave_analysis or '  (нет данных)'}
-
-ЗАДАЧА:
-1. Проанализируй паттерны ошибок — что общего у ложных срабатываний? Что общего у пропущенного спама?
-2. Найди системные проблемы в промпте
-3. Напиши ПОЛНОСТЬЮ НОВЫЙ промпт, который устраняет найденные проблемы
-4. Промпт ОБЯЗАН содержать {{{{few_shot_block}}}} и три категории: SPAM, NOT_SPAM, MAYBE_SPAM
-5. Промпт используется как system prompt, сообщение приходит в теге <message>
-
-Ответь в формате:
-АНАЛИЗ: подробный анализ (5-10 предложений)
-ИТОГОВЫЙ_ПРОМПТ: полный новый промпт"""
-
-        await bot.send_message(ADMIN_ID, "🔍 Генерирую новый промпт (может занять 1-2 минуты)...")
-
-        try:
-            response = await openai_client.chat.completions.create(
-                model=LLM_IMPROVEMENT_MODEL,
-                messages=[
-                    {"role": "system", "content": "Ты эксперт по антиспам-системам. Проводишь полный аудит. ОБЯЗАТЕЛЬНО используй маркер ИТОГОВЫЙ_ПРОМПТ: перед новым промптом."},
-                    {"role": "user", "content": audit_prompt},
-                ],
-                **_token_limit_param_improvement(16000),
-                **_temperature_param(LLM_IMPROVEMENT_MODEL, 0.3),
-                timeout=180,
-            )
-            text = (response.choices[0].message.content or "").strip()
-            finish = response.choices[0].finish_reason
-            logger.info(f"Audit LLM: len={len(text)}, finish={finish}, has_marker={'ИТОГОВЫЙ_ПРОМПТ' in text}")
-        except Exception as e:
-            logger.error(f"Audit LLM call failed: {e}")
-            await bot.send_message(ADMIN_ID, f"⚠️ Ошибка при генерации нового промпта: {e}\n\nТекущий промпт не изменён.")
-            # Всё равно показываем текущий промпт
-            prompt_escaped = html.escape(current_prompt)
-            chunks = [prompt_escaped[i:i+3700] for i in range(0, len(prompt_escaped), 3700)]
-            for i, chunk in enumerate(chunks):
-                h = "📝 <b>Текущий промпт:</b>\n\n" if i == 0 else f"📝 <b>Часть {i+1}:</b>\n\n"
-                await bot.send_message(ADMIN_ID, f"{h}<code>{chunk}</code>", parse_mode='HTML')
-            return
-
-        # ── Часть 1: Отчёт о текущем состоянии ──
-        fp_list = "\n".join(f"  • «{html.escape(t)}»" for t, _ in false_positives[:10]) or "  (нет)"
-        ms_list = "\n".join(f"  • «{html.escape(t)}»" for t, _ in missed_spam[:10]) or "  (нет)"
-
-        report1 = (
-            f"🔍 <b>АУДИТ: Часть 1 — Текущее состояние</b>\n\n"
-            f"📊 <b>Статистика:</b>\n"
-            f"  Решений админа: {stats['total_decisions']}\n"
-            f"  Training examples: {stats['total_examples']}\n"
-            f"  Забанено за 7 дней: {stats['banned_profiles']}\n"
-            f"  Точность бота: {accuracy:.0%} ({correct}/{len(all_decisions)})\n\n"
-            f"❌ <b>Ложные срабатывания ({len(false_positives)}):</b>\n{fp_list}\n\n"
-            f"⚠️ <b>Пропущенный спам ({len(missed_spam)}):</b>\n{ms_list}"
-        )
-        if wave_analysis:
-            report1 += f"\n\n🌊 <b>Спам-волны:</b>\n{html.escape(wave_analysis[:400])}"
-
-        await bot.send_message(ADMIN_ID, report1, parse_mode='HTML')
-
-        # ── Генерация нового промпта ──
-        # Парсим результат LLM
-        if "ИТОГОВЫЙ_ПРОМПТ:" not in text:
-            analysis = text[:800] if text else "LLM не вернул ответ"
-            await bot.send_message(ADMIN_ID,
-                f"⚠️ <b>Новый промпт не сгенерирован</b>\n\nАнализ:\n{html.escape(analysis[:800])}",
-                parse_mode='HTML')
-            return
-
-        parts_split = text.split("ИТОГОВЫЙ_ПРОМПТ:", 1)
-        analysis = parts_split[0].replace("АНАЛИЗ:", "").strip()
-        new_prompt = parts_split[1].strip()
-
-        # Валидация
-        problems = validate_prompt(new_prompt)
-        if problems:
-            await bot.send_message(ADMIN_ID, f"⚠️ Аудит: новый промпт невалиден: {', '.join(problems)}")
-            return
-
-        # ── Часть 2: Анализ проблем ──
-        report2 = (
-            f"🔍 <b>АУДИТ: Часть 2 — Анализ</b>\n\n"
-            f"{html.escape(analysis[:3800])}"
-        )
-        await bot.send_message(ADMIN_ID, report2, parse_mode='HTML')
-
-        # ── Часть 3: Валидация нового промпта ──
-        # Используем только text-detectable примеры (не profile spam)
-        text_examples = db.get_all_training_examples(text_only=True)
-        all_eval = [(t, s) for t, s, _, _ in text_examples]
-        applied = False
-
-        if len(all_eval) >= 10:
-            eval_set = all_eval[:50]
-            current_acc, current_ok, current_total, current_errors = await evaluate_prompt(current_prompt, eval_set)
-            new_acc, new_ok, new_total, new_errors = await evaluate_prompt(new_prompt, eval_set)
-
-            # Детальное сравнение: что исправлено, что сломалось
-            # Прогоняем оба промпта на тех же примерах и сравниваем
-            fixed = []  # ошибки старого, которые новый исправил
-            broken = []  # правильные старого, которые новый сломал
-
-            for err_text, err_expected, err_got in current_errors:
-                # Эта ошибка есть у старого — проверяем, исправил ли новый
-                if not any(e[0] == err_text for e in new_errors):
-                    fixed.append(f"✅ «{err_text[:60]}» ({err_expected})")
-
-            for err_text, err_expected, err_got in new_errors:
-                # Эта ошибка есть у нового но не было у старого
-                if not any(e[0] == err_text for e in current_errors):
-                    broken.append(f"🔴 «{err_text[:60]}» ({err_expected}→{err_got})")
-
-            fixed_block = "\n".join(fixed[:10]) or "  (ничего нового не исправлено)"
-            broken_block = "\n".join(broken[:10]) or "  (ничего не сломано)"
-            remaining_block = "\n".join(
-                f"  • «{t[:60]}» ({e}→{g})" for t, e, g in new_errors[:10]
-            ) or "  (нет ошибок)"
-
-            # Применяем если лучше, ИЛИ если текущая точность критически низкая (<50%) и новый хотя бы не хуже
-            should_apply = new_acc > current_acc or (current_acc < 0.5 and new_acc >= current_acc)
-            verdict = "✅ ПРИМЕНЁН" if should_apply else "❌ НЕ ПРИМЕНЁН (не лучше)"
-            if should_apply:
-                db.save_prompt_version(new_prompt, f"Аудит: {new_acc:.0%} vs {current_acc:.0%}")
-                applied = True
-
-            report3 = (
-                f"🔍 <b>АУДИТ: Часть 3 — Валидация</b>\n\n"
-                f"📈 <b>Точность:</b> {current_acc:.0%} → {new_acc:.0%} ({current_ok}/{current_total} → {new_ok}/{new_total})\n"
-                f"<b>Вердикт:</b> {verdict}\n\n"
-                f"<b>Исправлено новым промптом:</b>\n{fixed_block}\n\n"
-                f"<b>Новые ошибки (регрессии):</b>\n{broken_block}\n\n"
-                f"<b>Оставшиеся ошибки:</b>\n{remaining_block}"
-            )
-            if applied:
-                report3 += "\n\nОткатить: /rollback (из /history)"
-        else:
-            db.save_prompt_version(new_prompt, "Аудит (без валидации)")
-            applied = True
-            report3 = (
-                f"🔍 <b>АУДИТ: Часть 3 — Валидация</b>\n\n"
-                f"⚠️ Мало данных для валидации ({len(all_eval)} примеров). Промпт применён.\n"
-                f"Откатить: /rollback (из /history)"
-            )
-
-        await bot.send_message(ADMIN_ID, report3, parse_mode='HTML')
-
-        # ── Часть 4: Текущий промпт (полный текст) ──
-        active_prompt = new_prompt if applied else current_prompt
-        prompt_escaped = html.escape(active_prompt)
-        # Разбиваем на чанки по 3800 символов (лимит Telegram 4096 - разметка)
-        label = "📝 <b>АУДИТ: Часть 4 — Текущий промпт</b>\n\n"
-        if len(prompt_escaped) <= 3700:
-            await bot.send_message(ADMIN_ID, f"{label}<code>{prompt_escaped}</code>", parse_mode='HTML')
-        else:
-            chunks = [prompt_escaped[i:i+3700] for i in range(0, len(prompt_escaped), 3700)]
-            for i, chunk in enumerate(chunks):
-                header = label if i == 0 else f"📝 <b>Промпт (часть {i+1}):</b>\n\n"
-                await bot.send_message(ADMIN_ID, f"{header}<code>{chunk}</code>", parse_mode='HTML')
-
-    except Exception as e:
-        logger.error(f"Ошибка аудита: {e}", exc_info=True)
-        await bot.send_message(ADMIN_ID, f"⚠️ Ошибка аудита: {e}")
 
 
 async def detect_spam_waves(profiles: list) -> str:
@@ -1416,16 +1212,15 @@ async def detect_spam_waves(profiles: list) -> str:
     return "\n".join(waves) if waves else ""
 
 
-async def _weekly_audit_loop():
-    """Фоновый цикл: еженедельный аудит промпта."""
+async def _weekly_improve_loop():
+    """Фоновый цикл: еженедельное обучение промпта."""
     while True:
-        # Ждём 7 дней (604800 секунд)
-        await asyncio.sleep(604800)
+        await asyncio.sleep(604800)  # 7 дней
         try:
-            logger.info("🔍 Запуск еженедельного аудита промпта")
-            await run_full_audit()
+            logger.info("🔍 Запуск еженедельного обучения промпта")
+            await auto_improve_prompt("weekly", "еженедельное обучение")
         except Exception as e:
-            logger.error(f"Ошибка еженедельного аудита: {e}")
+            logger.error(f"Ошибка еженедельного обучения: {e}")
 
 
 # ──────────────────────────────────────────────
@@ -1638,7 +1433,6 @@ async def cmd_help(message: types.Message):
         "📚 <b>Команды</b>\n\n"
         "/stats — статистика\n"
         "/improve — принудительное улучшение промпта\n"
-        "/audit — полный аудит промпта на всех данных\n"
         "/models — какие LLM-модели сейчас используются\n"
         "/prompt — текущий промпт\n"
         "/history — история версий промпта\n"
@@ -1673,14 +1467,6 @@ async def cmd_improve(message: types.Message):
     """Принудительный запуск автоулучшения промпта."""
     await message.reply("🔄 Запускаю улучшение промпта...")
     asyncio.create_task(auto_improve_prompt("manual", "ручной запуск"))
-
-
-@dp.message(Command("audit"))
-@require_admin
-async def cmd_audit(message: types.Message):
-    """Полный аудит промпта на ВСЕХ данных."""
-    await message.reply("🔍 Запускаю полный аудит...")
-    asyncio.create_task(run_full_audit())
 
 
 @dp.message(Command("models"))
@@ -2034,7 +1820,6 @@ async def main():
         BotCommand(command="help", description="Справка"),
         BotCommand(command="stats", description="Статистика (админ)"),
         BotCommand(command="improve", description="Улучшить промпт (админ)"),
-        BotCommand(command="audit", description="Полный аудит промпта (админ)"),
         BotCommand(command="models", description="Проверить доступные LLM модели (админ)"),
         BotCommand(command="prompt", description="Текущий промпт (админ)"),
         BotCommand(command="history", description="История промптов (админ)"),
@@ -2076,7 +1861,7 @@ async def main():
         logger.warning(f"Не удалось отправить startup-отчёт: {e}")
 
     # Запускаем еженедельный аудит в фоне
-    asyncio.create_task(_weekly_audit_loop())
+    asyncio.create_task(_weekly_improve_loop())
     logger.info("📅 Еженедельный аудит запланирован")
 
     try:

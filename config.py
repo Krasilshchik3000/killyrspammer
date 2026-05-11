@@ -69,10 +69,12 @@ TRUSTED_USER_MESSAGES = int(os.getenv("TRUSTED_USER_MESSAGES", "3"))
 AUTO_IMPROVE_AFTER_ERRORS = int(os.getenv("AUTO_IMPROVE_AFTER_ERRORS", "5"))
 # Минимум примеров для валидации нового промпта
 MIN_VALIDATION_EXAMPLES = int(os.getenv("MIN_VALIDATION_EXAMPLES", "10"))
-# Максимум примеров для валидации (больше = точнее, но дороже)
-MAX_VALIDATION_EXAMPLES = int(os.getenv("MAX_VALIDATION_EXAMPLES", "100"))
-# Сколько correctly-classified примеров включать в валидацию (детектор регрессий)
-REGRESSION_CHECK_SAMPLES = int(os.getenv("REGRESSION_CHECK_SAMPLES", "30"))
+# Максимум spam-примеров для валидации
+MAX_VALIDATION_EXAMPLES = int(os.getenv("MAX_VALIDATION_EXAMPLES", "200"))
+# Сколько admin-reviewed правильных примеров включать в валидацию
+REGRESSION_CHECK_SAMPLES = int(os.getenv("REGRESSION_CHECK_SAMPLES", "50"))
+# Сколько обычных сообщений (без подозрений) включать в валидацию
+ORDINARY_MESSAGES_SAMPLES = int(os.getenv("ORDINARY_MESSAGES_SAMPLES", "300"))
 # Сколько попыток улучшить промпт за один цикл (каждая — вызов LLM)
 MAX_IMPROVEMENT_ATTEMPTS = int(os.getenv("MAX_IMPROVEMENT_ATTEMPTS", "5"))
 # Минимальный прирост точности для применения нового промпта (5%)
