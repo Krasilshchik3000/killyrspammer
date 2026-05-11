@@ -49,17 +49,29 @@ _http_client: httpx.AsyncClient = None
 _improvement_in_progress = False
 
 
+def _is_reasoning_model(model: str) -> bool:
+    """Reasoning models (gpt-5+, o-series) имеют особые требования к параметрам."""
+    return model.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
 def _token_limit_param(max_tokens: int) -> dict:
     """gpt-5+ требуют max_completion_tokens вместо max_tokens."""
-    if LLM_MODEL.startswith(("gpt-5", "o1", "o3", "o4")):
+    if _is_reasoning_model(LLM_MODEL):
         return {"max_completion_tokens": max_tokens}
     return {"max_tokens": max_tokens}
 
 
 def _token_limit_param_improvement(max_tokens: int) -> dict:
-    if LLM_IMPROVEMENT_MODEL.startswith(("gpt-5", "o1", "o3", "o4")):
+    if _is_reasoning_model(LLM_IMPROVEMENT_MODEL):
         return {"max_completion_tokens": max_tokens}
     return {"max_tokens": max_tokens}
+
+
+def _temperature_param(model: str, value: float) -> dict:
+    """Reasoning models (gpt-5+) НЕ поддерживают temperature — пропускаем."""
+    if _is_reasoning_model(model):
+        return {}
+    return {"temperature": value}
 
 
 class SpamResult(Enum):
@@ -259,7 +271,7 @@ async def check_user_profile(user_id: int) -> str:
                     {"role": "user", "content": "\n".join(profile_parts)},
                 ],
                 **_token_limit_param(10),
-                temperature=0,
+                **_temperature_param(LLM_MODEL, 0),
                 timeout=10,
             )
             answer = resp.choices[0].message.content.strip().upper()
@@ -413,7 +425,7 @@ async def classify_message(
         ],
         response_format=CLASSIFICATION_SCHEMA,
         **_token_limit_param(LLM_MAX_TOKENS),
-        temperature=LLM_TEMPERATURE,
+        **_temperature_param(LLM_MODEL, LLM_TEMPERATURE),
         timeout=LLM_TIMEOUT,
     )
     raw = response.choices[0].message.content.strip()
@@ -474,7 +486,7 @@ async def classify_image(
         ],
         response_format=CLASSIFICATION_SCHEMA,
         **_token_limit_param(LLM_MAX_TOKENS),
-        temperature=LLM_TEMPERATURE,
+        **_temperature_param(LLM_MODEL, LLM_TEMPERATURE),
         timeout=LLM_TIMEOUT,
     )
     raw = response.choices[0].message.content.strip()
@@ -738,7 +750,7 @@ async def generate_improved_prompt_with_strategy(
                 {"role": "user", "content": analysis_prompt},
             ],
             **_token_limit_param_improvement(16000),
-            temperature=0.5,  # Чуть выше для разнообразия стратегий
+            **_temperature_param(LLM_IMPROVEMENT_MODEL, 0.5),
             timeout=180,
         )
         text = (response.choices[0].message.content or "").strip()
@@ -1132,7 +1144,7 @@ async def run_full_audit():
                     {"role": "user", "content": audit_prompt},
                 ],
                 **_token_limit_param_improvement(16000),
-                temperature=0.3,
+                **_temperature_param(LLM_IMPROVEMENT_MODEL, 0.3),
                 timeout=180,
             )
             text = (response.choices[0].message.content or "").strip()
