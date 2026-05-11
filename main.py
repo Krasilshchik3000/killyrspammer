@@ -942,19 +942,23 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
             )
             return
 
-        # Считаем разбивку для прозрачности
+        # Считаем разбивку и общее количество доступных данных
         spam_count = sum(1 for _, is_s in spam_examples if is_s)
         notspam_count = len(spam_examples) - spam_count
         reg_spam = sum(1 for _, is_s in regression_set if is_s)
         reg_notspam = len(regression_set) - reg_spam
+        total_training = db.count_training_examples()
+        total_reviewed = db.count_correctly_classified()
+        total_ordinary = db.count_ordinary_messages()
 
         await _send_progress(
-            f"📊 <b>Датасет валидации</b> (все доступные данные)\n"
-            f"  • Training examples: {len(spam_examples)} "
+            f"📊 <b>Датасет валидации</b>\n"
+            f"  • Training examples: <b>{len(spam_examples)}</b> из {total_training} "
             f"(спам: {spam_count}, не-спам: {notspam_count})\n"
-            f"  • Прошедшие ревью админа: {len(regression_set)} "
+            f"  • Прошедшие ревью админа: <b>{len(regression_set)}</b> из {total_reviewed} "
             f"(спам: {reg_spam}, не-спам: {reg_notspam})\n"
-            f"  • Обычные сообщения (без ревью): {len(ordinary_set)}\n"
+            f"  • Обычные сообщения без ревью: <b>{len(ordinary_set)}</b> из {total_ordinary} "
+            f"(cap для скорости)\n"
             f"  • <b>Всего: {total_eval}</b>"
         )
 

@@ -584,6 +584,31 @@ def get_correctly_classified_messages(limit=30):
     ) or []
 
 
+def count_ordinary_messages() -> int:
+    """Сколько всего обычных сообщений в БД (для отчёта)."""
+    row = execute_query(
+        """SELECT COUNT(*) FROM messages
+           WHERE llm_result = 'НЕ_СПАМ' AND admin_decision IS NULL
+             AND text IS NOT NULL AND LENGTH(text) > 5""",
+        fetch='one'
+    )
+    return row[0] if row else 0
+
+
+def count_correctly_classified() -> int:
+    """Сколько всего сообщений прошедших ревью админа (для отчёта)."""
+    row = execute_query(
+        """SELECT COUNT(*) FROM messages
+           WHERE admin_decision IS NOT NULL
+             AND (
+                (llm_result = 'НЕ_СПАМ' AND admin_decision = 'НЕ_СПАМ')
+                OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'СПАМ')
+             )""",
+        fetch='one'
+    )
+    return row[0] if row else 0
+
+
 def get_ordinary_messages(limit=50):
     """Получить недавние сообщения, которые бот классифицировал как НЕ_СПАМ
     и которые не отправлялись на ревью. Это "обычные" сообщения от живых людей.
