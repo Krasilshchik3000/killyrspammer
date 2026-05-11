@@ -194,6 +194,7 @@ class TestAutoImprovePrompt:
             mock_db.get_validation_examples.return_value = [("spam example text", True)] * 10
             mock_db.get_correctly_classified_messages.return_value = [("normal msg", "НЕ_СПАМ")] * 5
             mock_db.get_ordinary_messages.return_value = [("hello", "НЕ_СПАМ")] * 5
+            mock_db.get_autobanned_spam.return_value = []
             mock_db.get_current_prompt.return_value = "old prompt with {message_text} СПАМ НЕ_СПАМ ВОЗМОЖНО_СПАМ {few_shot_block}"
             mock_bot.send_message = AsyncMock()
 
@@ -226,6 +227,7 @@ class TestAutoImprovePrompt:
             mock_db.get_validation_examples.return_value = [("spam example", True)] * 10
             mock_db.get_correctly_classified_messages.return_value = [("normal msg", "НЕ_СПАМ")] * 5
             mock_db.get_ordinary_messages.return_value = [("ordinary", "НЕ_СПАМ")] * 5
+            mock_db.get_autobanned_spam.return_value = []
             mock_db.get_current_prompt.return_value = "good prompt {message_text} СПАМ НЕ_СПАМ ВОЗМОЖНО_СПАМ {few_shot_block}"
             mock_bot.send_message = AsyncMock()
 

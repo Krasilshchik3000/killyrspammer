@@ -627,6 +627,34 @@ def get_ordinary_messages(limit=50):
     ) or []
 
 
+def get_autobanned_spam(limit=200):
+    """Получить сообщения, которые бот автоматически забанил как СПАМ
+    и админ не отменил решение (admin_decision IS NULL).
+
+    Это подтверждённый спам (бот забанил → админ не оспорил), пригодный для валидации.
+    """
+    return execute_query(
+        """SELECT text FROM messages
+           WHERE llm_result = 'СПАМ'
+             AND admin_decision IS NULL
+             AND text IS NOT NULL
+             AND LENGTH(text) > 5
+           ORDER BY created_at DESC LIMIT ?""",
+        (limit,), fetch='all'
+    ) or []
+
+
+def count_autobanned_spam() -> int:
+    """Сколько всего автозабаненных СПАМ-сообщений в БД (для отчёта)."""
+    row = execute_query(
+        """SELECT COUNT(*) FROM messages
+           WHERE llm_result = 'СПАМ' AND admin_decision IS NULL
+             AND text IS NOT NULL AND LENGTH(text) > 5""",
+        fetch='one'
+    )
+    return row[0] if row else 0
+
+
 def get_all_training_examples(text_only=False):
     """Все training examples (для полного аудита).
 
