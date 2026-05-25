@@ -67,6 +67,8 @@ TRUSTED_USER_MESSAGES = int(os.getenv("TRUSTED_USER_MESSAGES", "3"))
 # Автоматическое улучшение промпта
 # После скольких ошибок запускать улучшение промпта
 AUTO_IMPROVE_AFTER_ERRORS = int(os.getenv("AUTO_IMPROVE_AFTER_ERRORS", "5"))
+# Cooldown между автозапусками улучшения (минуты)
+AUTO_IMPROVE_COOLDOWN_MINUTES = int(os.getenv("AUTO_IMPROVE_COOLDOWN_MINUTES", "60"))
 # Минимум примеров для валидации нового промпта
 MIN_VALIDATION_EXAMPLES = int(os.getenv("MIN_VALIDATION_EXAMPLES", "10"))
 # Максимум spam-примеров для валидации

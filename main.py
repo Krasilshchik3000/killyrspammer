@@ -30,7 +30,8 @@ from config import (
     LLM_MODEL_CANDIDATES, LLM_IMPROVEMENT_MODEL_CANDIDATES,
     LLM_MAX_TOKENS, LLM_TEMPERATURE, LLM_TIMEOUT, MAX_REQUESTS_PER_MINUTE,
     FEW_SHOT_EXAMPLES_COUNT, CAS_API_URL, TRUSTED_USER_MESSAGES,
-    AUTO_IMPROVE_AFTER_ERRORS, MIN_VALIDATION_EXAMPLES, MAX_VALIDATION_EXAMPLES,
+    AUTO_IMPROVE_AFTER_ERRORS, AUTO_IMPROVE_COOLDOWN_MINUTES,
+    MIN_VALIDATION_EXAMPLES, MAX_VALIDATION_EXAMPLES,
     MAX_IMPROVEMENT_ATTEMPTS, REGRESSION_CHECK_SAMPLES, ORDINARY_MESSAGES_SAMPLES,
     MIN_ACCURACY_GAIN, MAX_REGRESSIONS,
 )
@@ -54,6 +55,8 @@ _user_request_times: dict[int, list[float]] = defaultdict(list)
 _http_client: httpx.AsyncClient = None
 # Блокировка чтобы не запускать два улучшения одновременно
 _improvement_in_progress = False
+# Время последней попытки улучшения (для cooldown между авто-запусками)
+_last_improvement_attempt: float = 0.0
 
 
 def _is_reasoning_model(model: str) -> bool:
@@ -1170,11 +1173,32 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
 
 
 async def maybe_trigger_improvement(error_type: str, message_text: str):
-    """Проверяет, пора ли запускать улучшение промпта."""
+    """Проверяет, пора ли запускать улучшение промпта.
+
+    Cooldown: после любой попытки (успешной или нет) не запускать новые
+    автоулучшения в течение AUTO_IMPROVE_COOLDOWN_MINUTES минут.
+    Это предотвращает дорогостоящие повторные запуски, если улучшение
+    не удалось и счётчик ошибок продолжает расти.
+    """
+    global _last_improvement_attempt
+
+    # Cooldown
+    elapsed = time.time() - _last_improvement_attempt
+    cooldown_sec = AUTO_IMPROVE_COOLDOWN_MINUTES * 60
+    if elapsed < cooldown_sec:
+        remaining = int((cooldown_sec - elapsed) / 60)
+        logger.info(f"Автоулучшение в cooldown (ещё {remaining} мин)")
+        return
+
+    if _improvement_in_progress:
+        logger.info("Автоулучшение уже идёт, пропускаем")
+        return
+
     errors_since = db.count_errors_since_last_improvement()
     logger.info(f"Ошибок с последнего улучшения: {errors_since}/{AUTO_IMPROVE_AFTER_ERRORS}")
 
     if errors_since >= AUTO_IMPROVE_AFTER_ERRORS:
+        _last_improvement_attempt = time.time()
         # Запускаем в фоне чтобы не блокировать ответ
         asyncio.create_task(auto_improve_prompt(error_type, message_text))
 
