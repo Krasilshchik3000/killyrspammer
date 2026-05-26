@@ -519,6 +519,36 @@ def get_bot_state(admin_id):
 
 
 # ──────────────────────────────────────────────
+# Метаданные (last_improvement_attempt и т.п.)
+# ──────────────────────────────────────────────
+
+def set_meta(key: str, value: str):
+    """Сохранить произвольную метаданность в bot_state (используем pending_prompt поле).
+
+    Используем admin_id = -1 для мета-записей, чтобы не конфликтовать с реальными админами.
+    """
+    META_ADMIN_ID = -1
+    execute_query("DELETE FROM bot_state WHERE admin_id = ? AND pending_prompt LIKE ?",
+                  (META_ADMIN_ID, f"{key}:%"))
+    execute_query(
+        "INSERT INTO bot_state (admin_id, awaiting_prompt_edit, pending_prompt, updated_at) VALUES (?, ?, ?, ?)",
+        (META_ADMIN_ID, False, f"{key}:{value}", datetime.now())
+    )
+
+
+def get_meta(key: str) -> str | None:
+    """Получить значение мета-ключа."""
+    META_ADMIN_ID = -1
+    row = execute_query(
+        "SELECT pending_prompt FROM bot_state WHERE admin_id = ? AND pending_prompt LIKE ? ORDER BY updated_at DESC LIMIT 1",
+        (META_ADMIN_ID, f"{key}:%"), fetch='one'
+    )
+    if row and row[0]:
+        return row[0][len(key) + 1:]  # отрезаем "key:"
+    return None
+
+
+# ──────────────────────────────────────────────
 # Профили забаненных (для детектора спам-волн)
 # ──────────────────────────────────────────────
 

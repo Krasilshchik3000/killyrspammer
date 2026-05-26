@@ -55,8 +55,6 @@ _user_request_times: dict[int, list[float]] = defaultdict(list)
 _http_client: httpx.AsyncClient = None
 # Блокировка чтобы не запускать два улучшения одновременно
 _improvement_in_progress = False
-# Время последней попытки улучшения (для cooldown между авто-запусками)
-_last_improvement_attempt: float = 0.0
 
 
 def _is_reasoning_model(model: str) -> bool:
@@ -1173,33 +1171,38 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
 
 
 async def maybe_trigger_improvement(error_type: str, message_text: str):
-    """Проверяет, пора ли запускать улучшение промпта.
+    """Проверяет, пора ли запускать автоулучшение промпта.
 
     Cooldown: после любой попытки (успешной или нет) не запускать новые
     автоулучшения в течение AUTO_IMPROVE_COOLDOWN_MINUTES минут.
-    Это предотвращает дорогостоящие повторные запуски, если улучшение
-    не удалось и счётчик ошибок продолжает расти.
+    По умолчанию — 7 дней. Время попытки сохраняется в БД и переживает рестарты.
+    Ручной /improve игнорирует cooldown.
     """
-    global _last_improvement_attempt
-
-    # Cooldown
-    elapsed = time.time() - _last_improvement_attempt
-    cooldown_sec = AUTO_IMPROVE_COOLDOWN_MINUTES * 60
-    if elapsed < cooldown_sec:
-        remaining = int((cooldown_sec - elapsed) / 60)
-        logger.info(f"Автоулучшение в cooldown (ещё {remaining} мин)")
-        return
-
     if _improvement_in_progress:
         logger.info("Автоулучшение уже идёт, пропускаем")
+        return
+
+    # Cooldown — читаем последнюю попытку из БД
+    last_attempt_str = db.get_meta("last_improvement_attempt")
+    last_attempt = float(last_attempt_str) if last_attempt_str else 0.0
+    elapsed = time.time() - last_attempt
+    cooldown_sec = AUTO_IMPROVE_COOLDOWN_MINUTES * 60
+
+    if elapsed < cooldown_sec:
+        remaining_min = int((cooldown_sec - elapsed) / 60)
+        if remaining_min >= 60:
+            remaining_str = f"{remaining_min // 60} ч {remaining_min % 60} мин"
+        else:
+            remaining_str = f"{remaining_min} мин"
+        logger.info(f"Автоулучшение в cooldown (ещё {remaining_str})")
         return
 
     errors_since = db.count_errors_since_last_improvement()
     logger.info(f"Ошибок с последнего улучшения: {errors_since}/{AUTO_IMPROVE_AFTER_ERRORS}")
 
     if errors_since >= AUTO_IMPROVE_AFTER_ERRORS:
-        _last_improvement_attempt = time.time()
-        # Запускаем в фоне чтобы не блокировать ответ
+        # Сразу записываем время попытки — чтобы параллельные триггеры не запускали второй цикл
+        db.set_meta("last_improvement_attempt", str(time.time()))
         asyncio.create_task(auto_improve_prompt(error_type, message_text))
 
 
@@ -1511,7 +1514,12 @@ async def cmd_stats(message: types.Message):
 @dp.message(Command("improve"))
 @require_admin
 async def cmd_improve(message: types.Message):
-    """Принудительный запуск автоулучшения промпта."""
+    """Принудительный запуск автоулучшения промпта (игнорирует cooldown)."""
+    if _improvement_in_progress:
+        await message.reply("⏳ Улучшение уже идёт, дождитесь окончания")
+        return
+    # Обновляем время попытки чтобы автоулучшение не сработало сразу после
+    db.set_meta("last_improvement_attempt", str(time.time()))
     await message.reply("🔄 Запускаю улучшение промпта...")
     asyncio.create_task(auto_improve_prompt("manual", "ручной запуск"))
 
