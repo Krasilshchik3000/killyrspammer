@@ -1889,6 +1889,29 @@ async def main():
     except Exception:
         pass
 
+    # Инициализация last_improvement_attempt: если метки нет в БД (свежий бот
+    # или после обновления кода), используем время последней версии промпта,
+    # либо текущее время. Это предотвращает срабатывание cooldown после деплоя.
+    if not db.get_meta("last_improvement_attempt"):
+        history = db.get_prompt_history(1)
+        if history:
+            # history: [(id, reason, created_at)]
+            created_at = history[0][2]
+            if hasattr(created_at, 'timestamp'):
+                ts = created_at.timestamp()
+            else:
+                # SQLite возвращает строку
+                from datetime import datetime as _dt
+                try:
+                    ts = _dt.fromisoformat(str(created_at)).timestamp()
+                except Exception:
+                    ts = time.time()
+            db.set_meta("last_improvement_attempt", str(ts))
+            logger.info(f"Инициализирован last_improvement_attempt из истории промптов")
+        else:
+            db.set_meta("last_improvement_attempt", str(time.time()))
+            logger.info(f"Инициализирован last_improvement_attempt текущим временем")
+
     # Автодетект моделей (пробуем каждую из списка до первой рабочей)
     detection = await _autodetect_models()
 
