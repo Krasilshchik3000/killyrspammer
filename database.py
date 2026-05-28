@@ -447,6 +447,49 @@ def find_user_by_message_text(text: str):
     return row[0] if row else None
 
 
+def find_messages_similar_to(spam_text: str, min_overlap_chars: int = 60) -> list:
+    """Найти сообщения с похожим текстом (для массового бана повторного спама).
+
+    Похожесть: если оба содержат общую подстроку из min_overlap_chars символов.
+    Алгоритм: берём кусок из середины spam_text и ищем его LIKE-ом.
+
+    Возвращает список (message_id, chat_id, user_id, text, llm_result, admin_decision).
+    """
+    if not spam_text or len(spam_text) < min_overlap_chars:
+        # Слишком короткий текст — точное совпадение
+        rows = execute_query(
+            "SELECT message_id, chat_id, user_id, text, llm_result, admin_decision "
+            "FROM messages WHERE text = ? AND user_id > 0",
+            (spam_text,), fetch='all'
+        )
+        return rows or []
+
+    # Берём 3 фрагмента из spam_text для LIKE поиска (начало, середина, конец)
+    chunks = [
+        spam_text[:min_overlap_chars],
+        spam_text[len(spam_text) // 2 - min_overlap_chars // 2:
+                  len(spam_text) // 2 + min_overlap_chars // 2],
+        spam_text[-min_overlap_chars:],
+    ]
+
+    seen = set()
+    result = []
+    for chunk in chunks:
+        # Экранируем LIKE-специальные символы
+        like_pattern = '%' + chunk.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+        rows = execute_query(
+            "SELECT message_id, chat_id, user_id, text, llm_result, admin_decision "
+            "FROM messages WHERE text LIKE ? AND user_id > 0 LIMIT 500",
+            (like_pattern,), fetch='all'
+        ) or []
+        for row in rows:
+            key = (row[0], row[1])  # (message_id, chat_id)
+            if key not in seen:
+                seen.add(key)
+                result.append(row)
+    return result
+
+
 def get_recent_mistakes(limit=10):
     return execute_query(
         """SELECT text, llm_result, admin_decision, created_at

@@ -1454,7 +1454,49 @@ async def handle_forwarded_spam(message: types.Message):
         banned, failed = await ban_user_in_all_groups(original_user_id)
         parts.append(f"🗑️ Удалено: {deleted} | 🔨 Забанен в {len(banned)} группах")
     else:
-        parts.append("⚠️ User ID недоступен — бан невозможен")
+        parts.append("⚠️ User ID оригинала недоступен")
+
+    # МАССОВЫЙ БАН по похожему тексту — ищем других пользователей,
+    # отправивших этот же спам в группы, и баним их тоже
+    if spam_text and len(spam_text) > 30:
+        try:
+            similar = db.find_messages_similar_to(spam_text, min_overlap_chars=60)
+            # Группируем по user_id, исключаем уже забаненного
+            other_spammers = {}  # user_id -> [(message_id, chat_id), ...]
+            for msg_id, chat_id, uid, _text, _llm, _admin in similar:
+                if uid == original_user_id or uid <= 0:
+                    continue
+                other_spammers.setdefault(uid, []).append((msg_id, chat_id))
+
+            if other_spammers:
+                banned_count = 0
+                deleted_count = 0
+                for uid, msgs in other_spammers.items():
+                    # Удаляем все его сообщения с похожим текстом
+                    for m_id, c_id in msgs:
+                        try:
+                            await bot.delete_message(c_id, m_id)
+                            deleted_count += 1
+                        except Exception:
+                            pass
+                    # Также удаляем все остальные его сообщения (на всякий случай)
+                    try:
+                        await delete_user_messages(uid)
+                    except Exception:
+                        pass
+                    # Баним во всех группах
+                    try:
+                        b, _ = await ban_user_in_all_groups(uid)
+                        if b:
+                            banned_count += 1
+                    except Exception as e:
+                        logger.warning(f"Ошибка бана {uid}: {e}")
+                parts.append(
+                    f"🌊 <b>Массовый бан повторного спама:</b> "
+                    f"забанено {banned_count} пользователей, удалено {deleted_count} сообщений"
+                )
+        except Exception as e:
+            logger.error(f"Ошибка массового бана по похожему тексту: {e}")
 
     await message.reply("\n".join(parts), parse_mode='HTML')
 
