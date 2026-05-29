@@ -1732,20 +1732,23 @@ async def handle_admin_text(message: types.Message):
 # Основной обработчик сообщений
 # ──────────────────────────────────────────────
 
-@dp.message(F.content_type.in_({'text', 'photo'}))
+@dp.message(F.chat.type.in_({'group', 'supergroup'}))
 async def handle_message(message: types.Message):
-    if message.chat.type == 'private':
-        return
-    if message.chat.type in ('group', 'supergroup') and message.chat.id not in ALLOWED_GROUP_IDS:
+    if message.chat.id not in ALLOWED_GROUP_IDS:
         return
     if should_skip_message(message):
         return
 
     uid, cid = message.from_user.id, message.chat.id
     username = message.from_user.username or message.from_user.full_name
+    # Собираем текст из всех возможных мест (text, caption, имя файла документа)
     msg_text = message.text or message.caption or ""
-    text_preview = msg_text[:80].replace('\n', ' ')
     has_photo = bool(message.photo)
+    has_document = bool(message.document)
+    # Для документов добавляем имя файла в текст для классификации
+    if has_document and message.document.file_name:
+        msg_text = (msg_text + " " + message.document.file_name).strip()
+    text_preview = msg_text[:80].replace('\n', ' ')
     user_msg_count = db.count_user_messages(uid, cid)
 
     # Пользователь с историей сообщений — доверенный, не проверяем через LLM
@@ -1759,8 +1762,13 @@ async def handle_message(message: types.Message):
             pass
         return
 
-    # Если нет ни текста, ни фото — пропускаем
-    if not msg_text and not has_photo:
+    # Документ от нового пользователя без текста — высокая подозрительность,
+    # обязательно сохраняем чтобы можно было удалить через пересылку
+    if has_document and not msg_text:
+        msg_text = f"[document: {message.document.file_name or 'untitled'}]"
+
+    # Если нет ничего — пропускаем
+    if not msg_text and not has_photo and not has_document:
         return
 
     is_cas_banned = await check_cas_ban(uid)
@@ -1784,6 +1792,16 @@ async def handle_message(message: types.Message):
         if forward_source:
             profile_spam_signal = f"{profile_spam_signal}; {forward_source}" if profile_spam_signal else forward_source
             logger.info(f"📨 Forward from new user @{username}: {forward_source}")
+
+    # Документ от нового пользователя — сильный сигнал спама
+    # (HTML, exe, apk, zip от незнакомого аккаунта почти всегда вредонос)
+    if has_document and user_msg_count <= 2:
+        suspicious_exts = ('.html', '.htm', '.exe', '.apk', '.zip', '.rar', '.bat', '.scr', '.js')
+        fname = (message.document.file_name or '').lower()
+        if any(fname.endswith(ext) for ext in suspicious_exts):
+            doc_signal = f"Документ '{message.document.file_name}' от нового пользователя"
+            profile_spam_signal = f"{profile_spam_signal}; {doc_signal}" if profile_spam_signal else doc_signal
+            logger.info(f"📎 Suspicious document from @{username}: {doc_signal}")
 
     # CAS + нет истории → автобан
     if is_cas_banned and user_msg_count == 0:
