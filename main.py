@@ -1458,9 +1458,13 @@ async def handle_forwarded_spam(message: types.Message):
 
     # МАССОВЫЙ БАН по похожему тексту — ищем других пользователей,
     # отправивших этот же спам в группы, и баним их тоже
-    if spam_text and len(spam_text) > 30:
+    if spam_text and len(spam_text) >= 20:
         try:
-            similar = db.find_messages_similar_to(spam_text, min_overlap_chars=60)
+            # Адаптируем порог под длину сообщения
+            overlap = min(60, max(20, len(spam_text) // 2))
+            similar = db.find_messages_similar_to(spam_text, min_overlap_chars=overlap)
+            logger.info(f"find_messages_similar_to нашёл {len(similar)} сообщений с похожим текстом")
+
             # Группируем по user_id, исключаем уже забаненного
             other_spammers = {}  # user_id -> [(message_id, chat_id), ...]
             for msg_id, chat_id, uid, _text, _llm, _admin in similar:
@@ -1471,6 +1475,7 @@ async def handle_forwarded_spam(message: types.Message):
             if other_spammers:
                 banned_count = 0
                 deleted_count = 0
+                fail_count = 0
                 for uid, msgs in other_spammers.items():
                     # Удаляем все его сообщения с похожим текстом
                     for m_id, c_id in msgs:
@@ -1479,24 +1484,35 @@ async def handle_forwarded_spam(message: types.Message):
                             deleted_count += 1
                         except Exception:
                             pass
-                    # Также удаляем все остальные его сообщения (на всякий случай)
+                    # Также удаляем все остальные его сообщения
                     try:
-                        await delete_user_messages(uid)
+                        extra_deleted = await delete_user_messages(uid)
+                        deleted_count += extra_deleted
                     except Exception:
                         pass
                     # Баним во всех группах
                     try:
-                        b, _ = await ban_user_in_all_groups(uid)
+                        b, f = await ban_user_in_all_groups(uid)
                         if b:
                             banned_count += 1
+                        else:
+                            fail_count += 1
                     except Exception as e:
                         logger.warning(f"Ошибка бана {uid}: {e}")
+                        fail_count += 1
                 parts.append(
-                    f"🌊 <b>Массовый бан повторного спама:</b> "
-                    f"забанено {banned_count} пользователей, удалено {deleted_count} сообщений"
+                    f"🌊 <b>Массовый бан повторного спама</b>\n"
+                    f"  • Найдено похожих: {len(similar)}\n"
+                    f"  • Уникальных пользователей: {len(other_spammers)}\n"
+                    f"  • Успешно забанено: {banned_count}\n"
+                    f"  • Удалено сообщений: {deleted_count}"
+                    + (f"\n  • Не удалось забанить: {fail_count}" if fail_count else "")
                 )
+            else:
+                parts.append(f"🔍 Поиск похожего текста: совпадений нет (искали {len(similar)} сообщений)")
         except Exception as e:
-            logger.error(f"Ошибка массового бана по похожему тексту: {e}")
+            logger.error(f"Ошибка массового бана по похожему тексту: {e}", exc_info=True)
+            parts.append(f"⚠️ Ошибка поиска похожих: {html.escape(str(e)[:100])}")
 
     await message.reply("\n".join(parts), parse_mode='HTML')
 
