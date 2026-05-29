@@ -1311,14 +1311,24 @@ async def unban_user_in_all_groups(user_id: int):
 
 
 async def delete_user_messages(user_id: int) -> int:
+    """Удалить все известные сообщения пользователя из всех групп.
+
+    Игнорирует chat_id=0 (служебные записи).
+    """
     messages = db.get_user_messages(user_id)
     deleted = 0
+    fails = 0
     for msg_id, chat_id in messages:
+        if not chat_id or chat_id == 0:
+            continue  # служебная запись, не настоящее сообщение
         try:
             await bot.delete_message(chat_id, msg_id)
             deleted += 1
-        except Exception:
-            pass
+        except Exception as e:
+            fails += 1
+            logger.debug(f"delete_message({chat_id}, {msg_id}) failed: {e}")
+    if fails:
+        logger.info(f"delete_user_messages({user_id}): deleted={deleted}, failed={fails}")
     return deleted
 
 
@@ -1450,11 +1460,23 @@ async def handle_forwarded_spam(message: types.Message):
             parts.append(f"🔍 Найден автор по тексту: <code>{original_user_id}</code>")
 
     if original_user_id:
+        # Сначала считаем, что бот знает в БД про этого юзера
+        known_messages = db.get_user_messages(original_user_id)
+        # Считаем только настоящие группы (chat_id != 0)
+        real_msgs = [m for m in known_messages if m[1] and m[1] != 0]
         deleted = await delete_user_messages(original_user_id)
         banned, failed = await ban_user_in_all_groups(original_user_id)
-        parts.append(f"🗑️ Удалено: {deleted} | 🔨 Забанен в {len(banned)} группах")
+        parts.append(
+            f"🔨 Забанен в {len(banned)} группах\n"
+            f"📋 Сообщений в БД от него: {len(real_msgs)}\n"
+            f"🗑 Успешно удалено: {deleted}"
+        )
+        if real_msgs and deleted == 0:
+            parts.append("⚠️ Сообщения в БД есть, но удалить не удалось (бот не админ / слишком старое / уже удалено)")
+        elif not real_msgs:
+            parts.append("ℹ️ Сообщений от этого пользователя нет в БД — возможно он постил в группе, где бота нет / до запуска бота")
     else:
-        parts.append("⚠️ User ID оригинала недоступен")
+        parts.append("⚠️ User ID оригинала недоступен (Deleted Account / приватность)")
 
     # МАССОВЫЙ БАН по похожему тексту — ищем других пользователей,
     # отправивших этот же спам в группы, и баним их тоже
