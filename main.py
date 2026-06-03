@@ -1842,6 +1842,79 @@ async def handle_message(message: types.Message):
 
 
 # ──────────────────────────────────────────────
+# Обработка ОТРЕДАКТИРОВАННЫХ сообщений
+# Паттерн спама: пользователь пишет нейтральное сообщение, потом
+# редактирует и подставляет туда спам. Каждое редактирование = новая проверка.
+# ──────────────────────────────────────────────
+
+@dp.edited_message(F.chat.type.in_({'group', 'supergroup'}))
+async def handle_edited_message(message: types.Message):
+    """Перепроверка сообщения после редактирования.
+
+    При редактировании пользователь становится подозрительным:
+    - Перепроверяем через LLM (не доверяем TRUSTED статусу для редактирований)
+    - Если стало спамом — банить + удалять + отчёт
+    - В контексте указываем что это РЕДАКТИРОВАНИЕ
+    """
+    if message.chat.id not in ALLOWED_GROUP_IDS:
+        return
+    if should_skip_message(message):
+        return
+
+    uid, cid = message.from_user.id, message.chat.id
+    username = message.from_user.username or message.from_user.full_name
+    msg_text = message.text or message.caption or ""
+    if message.document and message.document.file_name:
+        msg_text = (msg_text + " " + message.document.file_name).strip()
+    text_preview = msg_text[:80].replace('\n', ' ')
+
+    if not msg_text and not message.photo and not message.document:
+        return
+
+    user_msg_count = db.count_user_messages(uid, cid)
+    logger.info(f"✏️ EDIT @{username} (msgs={user_msg_count}) | {message.chat.title} | «{text_preview}»")
+
+    # Получаем фото-URL если есть
+    photo_url = None
+    if message.photo:
+        try:
+            photo = message.photo[-1]
+            file_info = await bot.get_file(photo.file_id)
+            photo_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
+        except Exception:
+            pass
+
+    # Сильный сигнал: редактирование — типичный паттерн обхода антиспама
+    edit_signal = "СООБЩЕНИЕ БЫЛО ОТРЕДАКТИРОВАНО — типичный паттерн обхода антиспам-бота"
+    is_cas_banned = await check_cas_ban(uid)
+
+    result, reasoning = await check_message_with_llm(
+        msg_text, uid, user_msg_count, is_cas_banned, photo_url, edit_signal
+    )
+
+    # Обновляем запись в БД новым результатом
+    try:
+        existing = db.get_message_by_id(message.message_id)
+        edited_reasoning = (reasoning or "") + " [edited]"
+        if existing:
+            db.update_message_after_edit(message.message_id, msg_text, result.value, edited_reasoning)
+        else:
+            db.save_message(message.message_id, cid, uid, message.from_user.username or '',
+                            msg_text, result.value, edited_reasoning)
+    except Exception as e:
+        logger.error(f"Ошибка обновления отредактированного сообщения: {e}")
+
+    emoji = {"СПАМ": "🔴", "ВОЗМОЖНО_СПАМ": "🟡", "НЕ_СПАМ": "🟢"}[result.value]
+    logger.info(f"{emoji} EDIT→{result.value} @{username} | reason: {reasoning[:100]}")
+
+    if result == SpamResult.SPAM:
+        # Помечаем reasoning что это после редактирования
+        await ban_and_report(message, result, f"[EDIT] {reasoning}")
+    elif result == SpamResult.MAYBE_SPAM:
+        await send_to_admin(message, result, f"[EDIT] {reasoning}")
+
+
+# ──────────────────────────────────────────────
 # Callback: фидбек (СПАМ / НЕ СПАМ) → автообучение
 # ──────────────────────────────────────────────
 

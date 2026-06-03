@@ -430,6 +430,14 @@ def get_message_by_id(message_id: int):
     )
 
 
+def update_message_after_edit(message_id: int, text: str, llm_result: str, reasoning: str):
+    """Обновить запись о сообщении после его редактирования пользователем."""
+    execute_query(
+        "UPDATE messages SET text = ?, llm_result = ?, reasoning = ? WHERE message_id = ?",
+        (text, llm_result, reasoning, message_id)
+    )
+
+
 def get_user_messages(user_id: int, limit=100):
     """Получить все message_id и chat_id сообщений пользователя (для удаления)."""
     return execute_query(
