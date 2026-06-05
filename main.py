@@ -1851,10 +1851,13 @@ async def handle_message(message: types.Message):
 async def handle_edited_message(message: types.Message):
     """Перепроверка сообщения после редактирования.
 
-    При редактировании пользователь становится подозрительным:
-    - Перепроверяем через LLM (не доверяем TRUSTED статусу для редактирований)
-    - Если стало спамом — банить + удалять + отчёт
-    - В контексте указываем что это РЕДАКТИРОВАНИЕ
+    Логика: классифицируем НОВЫЙ текст без предвзятости. Реакция бота
+    зависит от того, как изменилось решение по сравнению с предыдущим:
+      - старое НЕ_СПАМ и новое НЕ_СПАМ → тишина (обычное редактирование)
+      - старое НЕ_СПАМ и новое СПАМ → бан+удаление, отчёт админу с пометкой
+        «edit-to-spam» (классический паттерн обхода)
+      - старое НЕ_СПАМ и новое ВОЗМОЖНО_СПАМ → ревью админу
+      - всё остальное логируем, без шумных уведомлений
     """
     if message.chat.id not in ALLOWED_GROUP_IDS:
         return
@@ -1871,8 +1874,23 @@ async def handle_edited_message(message: types.Message):
     if not msg_text and not message.photo and not message.document:
         return
 
+    # Получаем предыдущий вердикт из БД
+    existing = db.get_message_by_id(message.message_id)
+    previous_result = None
+    previous_text = None
+    if existing:
+        previous_text = existing[0]
+        previous_result = existing[1]
+        # Тривиальное редактирование: текст не изменился (Telegram иногда шлёт
+        # edited_message при изменении превью URL и т.д.)
+        if previous_text == msg_text:
+            return
+
     user_msg_count = db.count_user_messages(uid, cid)
-    logger.info(f"✏️ EDIT @{username} (msgs={user_msg_count}) | {message.chat.title} | «{text_preview}»")
+    logger.info(
+        f"✏️ EDIT @{username} (msgs={user_msg_count}) | {message.chat.title} | "
+        f"«{text_preview}» (prev={previous_result})"
+    )
 
     # Получаем фото-URL если есть
     photo_url = None
@@ -1884,17 +1902,25 @@ async def handle_edited_message(message: types.Message):
         except Exception:
             pass
 
-    # Сильный сигнал: редактирование — типичный паттерн обхода антиспама
-    edit_signal = "СООБЩЕНИЕ БЫЛО ОТРЕДАКТИРОВАНО — типичный паттерн обхода антиспам-бота"
     is_cas_banned = await check_cas_ban(uid)
 
+    # Классифицируем новый текст БЕЗ предвзятости.
+    # Если предыдущее решение было НЕ_СПАМ, добавим контекст для прозрачности:
+    # это поможет LLM осознать паттерн edit-to-spam, но без жёсткой инструкции
+    # "редактирование = подозрительно".
+    edit_context = ""
+    if previous_result == "НЕ_СПАМ" and previous_text:
+        edit_context = (
+            f"Это редактирование. Раньше текст был: «{previous_text[:200]}». "
+            f"Оценивай только намерение нового текста."
+        )
+
     result, reasoning = await check_message_with_llm(
-        msg_text, uid, user_msg_count, is_cas_banned, photo_url, edit_signal
+        msg_text, uid, user_msg_count, is_cas_banned, photo_url, edit_context
     )
 
     # Обновляем запись в БД новым результатом
     try:
-        existing = db.get_message_by_id(message.message_id)
         edited_reasoning = (reasoning or "") + " [edited]"
         if existing:
             db.update_message_after_edit(message.message_id, msg_text, result.value, edited_reasoning)
@@ -1905,13 +1931,23 @@ async def handle_edited_message(message: types.Message):
         logger.error(f"Ошибка обновления отредактированного сообщения: {e}")
 
     emoji = {"СПАМ": "🔴", "ВОЗМОЖНО_СПАМ": "🟡", "НЕ_СПАМ": "🟢"}[result.value]
-    logger.info(f"{emoji} EDIT→{result.value} @{username} | reason: {reasoning[:100]}")
+    logger.info(f"{emoji} EDIT→{result.value} @{username} | prev={previous_result} | reason: {reasoning[:100]}")
 
-    if result == SpamResult.SPAM:
-        # Помечаем reasoning что это после редактирования
+    # Реакция зависит от перехода
+    was_clean = previous_result in (None, "НЕ_СПАМ")
+    became_spam = result == SpamResult.SPAM
+    became_maybe = result == SpamResult.MAYBE_SPAM
+
+    if became_spam and was_clean:
+        # Классический edit-to-spam — реагируем жёстко
+        await ban_and_report(message, result, f"[EDIT-TO-SPAM] {reasoning}")
+    elif became_spam:
+        # Был подозрительный, теперь СПАМ — тоже бан
         await ban_and_report(message, result, f"[EDIT] {reasoning}")
-    elif result == SpamResult.MAYBE_SPAM:
-        await send_to_admin(message, result, f"[EDIT] {reasoning}")
+    elif became_maybe and was_clean:
+        # Появилось что-то подозрительное в безобидном — на ревью
+        await send_to_admin(message, result, f"[EDIT] Было НЕ_СПАМ, стало подозрительно. {reasoning}")
+    # Иначе — молча обновили БД и не дёргаем админа
 
 
 # ──────────────────────────────────────────────
