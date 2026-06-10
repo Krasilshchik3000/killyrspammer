@@ -2250,11 +2250,10 @@ async def main():
             report_lines.append(f"  • Улучшение промпта: <code>{detection['improvement']}</code>")
         else:
             report_lines.append("  • ❌ Не найдена рабочая модель улучшения!")
+        # Пропущенные кандидаты — только в логи; админу это не нужно,
+        # если рабочие модели нашлись (см. /models для деталей)
         if detection["errors"]:
-            failed_names = ", ".join(e.split(":")[0] for e in detection["errors"])
-            report_lines.append(
-                f"\n<i>Недоступны на этом ключе (пропущены при подборе): {html.escape(failed_names)}</i>"
-            )
+            logger.info(f"Автодетект пропустил: {detection['errors']}")
         await bot.send_message(ADMIN_ID, "\n".join(report_lines), parse_mode='HTML')
     except Exception as e:
         logger.warning(f"Не удалось отправить startup-отчёт: {e}")
