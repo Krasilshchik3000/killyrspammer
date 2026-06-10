@@ -90,23 +90,38 @@ class TestPromptVersioning:
 
 class TestTrainingExamples:
     def test_add_and_get_examples(self):
-        """Добавление и получение обучающих примеров."""
+        """Few-shot выборка сбалансирована: спам и не-спам перемешаны."""
         db.add_training_example("спам текст", True, "test")
         db.add_training_example("нормальный текст", False, "test")
 
         examples = db.get_few_shot_examples(10)
         assert len(examples) == 2
-        # Последний добавленный — первый в списке (ORDER BY id DESC)
-        assert examples[0][0] == "нормальный текст"
-        assert examples[0][1] == 0  # SQLite: False = 0
+        labels = {bool(is_spam) for _, is_spam in examples}
+        assert labels == {True, False}  # обе категории присутствуют
 
     def test_few_shot_limit(self):
-        """Лимит на количество примеров работает."""
+        """Лимит соблюдается, выборка сбалансирована (half spam / half ham)."""
         for i in range(20):
             db.add_training_example(f"example_{i}", i % 2 == 0, "test")
 
-        examples = db.get_few_shot_examples(5)
-        assert len(examples) == 5
+        examples = db.get_few_shot_examples(6)
+        assert len(examples) == 6
+        spam_count = sum(1 for _, is_spam in examples if is_spam)
+        assert spam_count == 3  # ровно половина
+
+    def test_few_shot_excludes_context_spam(self):
+        """КРИТИЧНО: профильный спам (невинный текст) не попадает в few-shot.
+
+        Иначе модель учится флагать обычные короткие реплики (few-shot poisoning).
+        """
+        db.add_training_example("Круто", True, "test", spam_type='context')
+        db.add_training_example("Покупайте курс заработка!", True, "test", spam_type='text')
+        db.add_training_example("обычное сообщение", False, "test")
+
+        examples = db.get_few_shot_examples(10)
+        spam_texts = [t for t, is_spam in examples if is_spam]
+        assert "Круто" not in spam_texts
+        assert "Покупайте курс заработка!" in spam_texts
 
 
 class TestMessages:

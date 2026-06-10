@@ -210,3 +210,45 @@ class TestCheckRateLimit:
         for _ in range(5):
             self.check(1)
         assert self.check(2) is True
+
+
+class TestRiskEscalation:
+    """Эскалация вердикта по сигналам риска (apply_risk_escalation)."""
+
+    def setup_method(self):
+        from main import apply_risk_escalation, SpamResult
+        self.esc = apply_risk_escalation
+        self.R = SpamResult
+
+    def test_no_signals_no_change(self):
+        r, _ = self.esc(self.R.MAYBE_SPAM, "x", [])
+        assert r == self.R.MAYBE_SPAM
+        r, _ = self.esc(self.R.NOT_SPAM, "x", [])
+        assert r == self.R.NOT_SPAM
+
+    def test_maybe_plus_strong_becomes_spam(self):
+        r, reason = self.esc(self.R.MAYBE_SPAM, "x", [("CAS-бан", 'strong')])
+        assert r == self.R.SPAM
+        assert "Эскалация" in reason
+
+    def test_maybe_plus_two_weak_becomes_spam(self):
+        r, _ = self.esc(self.R.MAYBE_SPAM, "x",
+                        [("профиль", 'weak'), ("forward", 'weak')])
+        assert r == self.R.SPAM
+
+    def test_maybe_plus_one_weak_stays_maybe(self):
+        r, _ = self.esc(self.R.MAYBE_SPAM, "x", [("профиль", 'weak')])
+        assert r == self.R.MAYBE_SPAM
+
+    def test_notspam_plus_weak_becomes_maybe(self):
+        r, reason = self.esc(self.R.NOT_SPAM, "x", [("профиль", 'weak')])
+        assert r == self.R.MAYBE_SPAM
+        assert "сигналы риска" in reason
+
+    def test_notspam_plus_strong_becomes_maybe(self):
+        r, _ = self.esc(self.R.NOT_SPAM, "x", [("документ", 'strong')])
+        assert r == self.R.MAYBE_SPAM
+
+    def test_spam_verdict_unchanged(self):
+        r, _ = self.esc(self.R.SPAM, "x", [("CAS-бан", 'strong')])
+        assert r == self.R.SPAM

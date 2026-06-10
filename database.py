@@ -337,12 +337,33 @@ def add_training_example(text: str, is_spam: bool, source: str, spam_type: str =
 
 
 def get_few_shot_examples(limit=10):
-    """Получить последние обучающие примеры для few-shot контекста."""
-    rows = execute_query(
-        "SELECT text, is_spam FROM training_examples ORDER BY id DESC LIMIT ?",
-        (limit,), fetch='all'
-    )
-    return rows or []
+    """Получить сбалансированные обучающие примеры для few-shot контекста.
+
+    КРИТИЧНО: спам-примеры фильтруются по spam_type='text'. Профильный спам
+    (невинный текст от спамера, например «Круто») сюда попадать НЕ должен —
+    иначе модель учится флагать обычные короткие реплики (few-shot poisoning).
+
+    Баланс: половина спам, половина не-спам — чтобы не смещать модель.
+    """
+    half = max(1, limit // 2)
+    spam = execute_query(
+        "SELECT text, is_spam FROM training_examples "
+        "WHERE is_spam = ? AND (spam_type = 'text' OR spam_type IS NULL) "
+        "ORDER BY id DESC LIMIT ?",
+        (True, half), fetch='all'
+    ) or []
+    not_spam = execute_query(
+        "SELECT text, is_spam FROM training_examples WHERE is_spam = ? ORDER BY id DESC LIMIT ?",
+        (False, half), fetch='all'
+    ) or []
+    # Перемешиваем спам/не-спам для нейтральности порядка
+    result = []
+    for i in range(max(len(spam), len(not_spam))):
+        if i < len(spam):
+            result.append(spam[i])
+        if i < len(not_spam):
+            result.append(not_spam[i])
+    return result
 
 
 def get_validation_examples(limit=30):
@@ -643,95 +664,6 @@ def get_all_admin_decisions(limit=500):
            ORDER BY admin_decided_at DESC LIMIT ?""",
         (limit,), fetch='all'
     ) or []
-
-
-def get_correctly_classified_messages(limit=30):
-    """Получить недавние сообщения, где бот и админ согласились.
-
-    Используется для детектора регрессий: новый промпт не должен
-    портить классификацию того, что уже работает.
-    """
-    return execute_query(
-        """SELECT text, llm_result FROM messages
-           WHERE admin_decision IS NOT NULL
-             AND (
-                (llm_result = 'НЕ_СПАМ' AND admin_decision = 'НЕ_СПАМ')
-                OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'СПАМ')
-             )
-           ORDER BY admin_decided_at DESC LIMIT ?""",
-        (limit,), fetch='all'
-    ) or []
-
-
-def count_ordinary_messages() -> int:
-    """Сколько всего обычных сообщений в БД (для отчёта)."""
-    row = execute_query(
-        """SELECT COUNT(*) FROM messages
-           WHERE llm_result = 'НЕ_СПАМ' AND admin_decision IS NULL
-             AND text IS NOT NULL AND LENGTH(text) > 5""",
-        fetch='one'
-    )
-    return row[0] if row else 0
-
-
-def count_correctly_classified() -> int:
-    """Сколько всего сообщений прошедших ревью админа (для отчёта)."""
-    row = execute_query(
-        """SELECT COUNT(*) FROM messages
-           WHERE admin_decision IS NOT NULL
-             AND (
-                (llm_result = 'НЕ_СПАМ' AND admin_decision = 'НЕ_СПАМ')
-                OR (llm_result IN ('СПАМ', 'ВОЗМОЖНО_СПАМ') AND admin_decision = 'СПАМ')
-             )""",
-        fetch='one'
-    )
-    return row[0] if row else 0
-
-
-def get_ordinary_messages(limit=50):
-    """Получить недавние сообщения, которые бот классифицировал как НЕ_СПАМ
-    и которые не отправлялись на ревью. Это "обычные" сообщения от живых людей.
-
-    Используется в валидации: новый промпт не должен начинать флагать обычный текст.
-    Фильтруем короткие/пустые сообщения и системные.
-    """
-    return execute_query(
-        """SELECT text, llm_result FROM messages
-           WHERE llm_result = 'НЕ_СПАМ'
-             AND admin_decision IS NULL
-             AND text IS NOT NULL
-             AND LENGTH(text) > 5
-           ORDER BY created_at DESC LIMIT ?""",
-        (limit,), fetch='all'
-    ) or []
-
-
-def get_autobanned_spam(limit=200):
-    """Получить сообщения, которые бот автоматически забанил как СПАМ
-    и админ не отменил решение (admin_decision IS NULL).
-
-    Это подтверждённый спам (бот забанил → админ не оспорил), пригодный для валидации.
-    """
-    return execute_query(
-        """SELECT text FROM messages
-           WHERE llm_result = 'СПАМ'
-             AND admin_decision IS NULL
-             AND text IS NOT NULL
-             AND LENGTH(text) > 5
-           ORDER BY created_at DESC LIMIT ?""",
-        (limit,), fetch='all'
-    ) or []
-
-
-def count_autobanned_spam() -> int:
-    """Сколько всего автозабаненных СПАМ-сообщений в БД (для отчёта)."""
-    row = execute_query(
-        """SELECT COUNT(*) FROM messages
-           WHERE llm_result = 'СПАМ' AND admin_decision IS NULL
-             AND text IS NOT NULL AND LENGTH(text) > 5""",
-        fetch='one'
-    )
-    return row[0] if row else 0
 
 
 def get_validation_dataset(limit: int = 1000):

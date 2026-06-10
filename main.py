@@ -32,8 +32,7 @@ from config import (
     FEW_SHOT_EXAMPLES_COUNT, CAS_API_URL, TRUSTED_USER_MESSAGES,
     AUTO_IMPROVE_AFTER_ERRORS, AUTO_IMPROVE_COOLDOWN_MINUTES,
     MIN_VALIDATION_EXAMPLES, MAX_VALIDATION_EXAMPLES,
-    MAX_IMPROVEMENT_ATTEMPTS, REGRESSION_CHECK_SAMPLES, ORDINARY_MESSAGES_SAMPLES,
-    MIN_ACCURACY_GAIN, MAX_REGRESSIONS,
+    MAX_IMPROVEMENT_ATTEMPTS, ORDINARY_MESSAGES_SAMPLES,
 )
 from config import LLM_MODEL as _ENV_LLM_MODEL
 from config import LLM_IMPROVEMENT_MODEL as _ENV_LLM_IMPROVEMENT_MODEL
@@ -520,15 +519,22 @@ async def classify_image(
     user_msg_count: int = 0,
     is_cas_banned: bool = False,
 ) -> tuple[SpamResult, str]:
-    """Классификация изображения через Vision API."""
+    """Классификация изображения через Vision API.
+
+    Использует ОБУЧАЕМЫЙ промпт (как и текстовая классификация) + few-shot,
+    чтобы обучение системы влияло и на картиночный спам. К промпту добавляется
+    vision-инструкция: анализировать текст на картинке.
+    """
+    learned_prompt = db.get_current_prompt()
+    few_shot = build_few_shot_block()
+    base_prompt = safe_format_prompt(learned_prompt, "", few_shot)
+    base_prompt = base_prompt.replace("Сообщение: «»", "").strip()
     system_prompt = (
-        "Ты антиспам-классификатор для Telegram-групп.\n"
-        "Тебе отправлено изображение из чата. Проанализируй текст на картинке и содержимое.\n"
-        "Классифицируй как SPAM, NOT_SPAM или MAYBE_SPAM.\n\n"
-        "SPAM: реклама товаров/услуг, продажа наркотиков, казино, криптоспам, "
-        "мошенничество, фишинг, ссылки на подозрительные сайты.\n"
-        "NOT_SPAM: мемы, фотографии, скриншоты бесед, обычный контент.\n"
-        "MAYBE_SPAM: неясно, нужна проверка админом."
+        base_prompt
+        + "\n\nОСОБЫЙ РЕЖИМ: тебе придёт ИЗОБРАЖЕНИЕ из чата. Прочитай текст на картинке "
+        "(если есть) и оцени содержимое по тем же правилам. Рекламные баннеры, "
+        "объявления о продаже/заработке/подработке, QR-коды с призывом, скриншоты "
+        "казино/ставок — SPAM. Мемы, фото, скриншоты переписок — NOT_SPAM."
     )
 
     context_parts = []
@@ -573,16 +579,52 @@ async def classify_image(
     return result, reasoning
 
 
+def apply_risk_escalation(
+    result: SpamResult, reasoning: str, risk_signals: list,
+) -> tuple[SpamResult, str]:
+    """Эскалация вердикта по совокупности сигналов риска.
+
+    risk_signals: [(описание, 'strong'|'weak'), ...]
+      strong: CAS-бан, опасный документ от нового юзера
+      weak: подозрительный профиль, forward из канала от нового юзера
+
+    Правила:
+      MAYBE + ≥1 strong ИЛИ ≥2 weak → SPAM (бан)
+      NOT_SPAM + ≥1 strong ИЛИ ≥2 weak → MAYBE (ревью)
+      NOT_SPAM + 1 weak → MAYBE (ревью)
+    Обычные пользователи без сигналов не затрагиваются.
+    """
+    if not risk_signals:
+        return result, reasoning
+
+    strong = [s for s, lvl in risk_signals if lvl == 'strong']
+    weak = [s for s, lvl in risk_signals if lvl == 'weak']
+    all_names = ", ".join(strong + weak)
+
+    if result == SpamResult.MAYBE_SPAM and (strong or len(weak) >= 2):
+        return SpamResult.SPAM, f"Эскалация ВОЗМОЖНО_СПАМ→СПАМ по сигналам риска ({all_names}). {reasoning}"
+    if result == SpamResult.NOT_SPAM and (strong or weak):
+        return SpamResult.MAYBE_SPAM, f"Текст безобидный, но сигналы риска: {all_names}. {reasoning}"
+    return result, reasoning
+
+
 async def check_message_with_llm(
     message_text: str,
     user_id: int = None,
     user_msg_count: int = 0,
     is_cas_banned: bool = False,
     photo_url: str = None,
-    profile_signal: str = "",
+    context_note: str = "",
 ) -> tuple[SpamResult, str]:
+    """Классификация сообщения. context_note — информационный контекст для LLM
+    (профиль, история редактирования); НЕ вызывает автоматическую эскалацию —
+    за эскалацию отвечает apply_risk_escalation() на стороне вызывающего."""
     if user_id and not check_rate_limit(user_id):
-        return SpamResult.MAYBE_SPAM, "Rate limit exceeded"
+        # Доверенные пользователи при rate limit просто пропускаются,
+        # новые — на ревью (флуд от нового аккаунта подозрителен сам по себе)
+        if user_msg_count >= TRUSTED_USER_MESSAGES:
+            return SpamResult.NOT_SPAM, "Rate limit (trusted user, пропущен)"
+        return SpamResult.MAYBE_SPAM, "Rate limit: слишком много сообщений от нового пользователя"
 
     try:
         # Если есть фото — используем Vision API
@@ -591,22 +633,15 @@ async def check_message_with_llm(
             logger.info(f"Vision → {result.value} (caption_len={len(message_text or '')}, msgs={user_msg_count})")
             return result, reasoning
 
-        # Если профиль подозрительный — добавляем в контекст для LLM
         effective_text = message_text or ""
-        if profile_signal:
-            effective_text += f"\n\n[PROFILE CONTEXT: {profile_signal}]"
+        if context_note:
+            effective_text += f"\n\n[CONTEXT: {context_note}]"
 
         # Текстовая классификация
         prompt_template = db.get_current_prompt()
         few_shot = build_few_shot_block()
         result, reasoning = await classify_message(prompt_template, effective_text, few_shot, user_msg_count, is_cas_banned)
-        logger.info(f"LLM → {result.value} (len={len(message_text or '')}, msgs={user_msg_count}, cas={is_cas_banned}, profile={'yes' if profile_signal else 'no'})")
-
-        # Если профиль спамный, но LLM сказал НЕ_СПАМ → повышаем до MAYBE_SPAM
-        if profile_signal and result == SpamResult.NOT_SPAM:
-            result = SpamResult.MAYBE_SPAM
-            reasoning = f"Сообщение безобидное, но профиль подозрительный: {profile_signal}"
-
+        logger.info(f"LLM → {result.value} (len={len(message_text or '')}, msgs={user_msg_count}, cas={is_cas_banned}, ctx={'yes' if context_note else 'no'})")
         return result, reasoning
     except Exception as e:
         logger.error(f"LLM error: {e}")
@@ -676,38 +711,24 @@ async def evaluate_prompt(prompt_template: str, examples: list) -> tuple[float, 
 
 
 # 5 стратегий генерации — каждая попытка использует свою
+# 3 стратегии от консервативной к радикальной. Цикл останавливается на первой,
+# давшей net-positive результат (early-stop) — это экономит 40-60% стоимости.
 IMPROVEMENT_STRATEGIES = [
-    {
-        "name": "обобщение паттернов",
-        "instruction": (
-            "Найди ОБЩИЕ паттерны в ошибках бота. Не вставляй конкретные тексты сообщений. "
-            "Сформулируй универсальные правила-обобщения, описывающие НАМЕРЕНИЕ и СТРУКТУРУ "
-            "спам-сообщений. Например, вместо «сообщения вроде „Купи курс“» пиши «короткие "
-            "рекламные призывы с глаголами действия». Сохрани все существующие правила, добавь новые обобщения."
-        ),
-    },
-    {
-        "name": "упрощение и фокус на intent",
-        "instruction": (
-            "Текущий промпт перегружен. Сократи его, убери дубликаты и избыточные примеры. "
-            "Сфокусируй модель на НАМЕРЕНИИ автора (продажа, вербовка, реклама) "
-            "вместо ключевых слов. Сохрани ключевые категории спама и исключения для NOT_SPAM."
-        ),
-    },
-    {
-        "name": "реструктуризация",
-        "instruction": (
-            "Переструктурируй промпт: чёткие секции SPAM/NOT_SPAM/MAYBE_SPAM с критериями. "
-            "Каждая категория — это описание ТИПА сообщения, а не список конкретных фраз. "
-            "Добавь чёткую логику принятия решения (decision tree)."
-        ),
-    },
     {
         "name": "точечное расширение",
         "instruction": (
             "Сделай МИНИМАЛЬНОЕ изменение: добавь 1-2 правила, покрывающих новые типы ошибок. "
             "Не трогай остальное. Новые правила должны быть универсальными (тип/паттерн), "
             "а не дословными цитатами сообщений."
+        ),
+    },
+    {
+        "name": "обобщение и упрощение",
+        "instruction": (
+            "Найди ОБЩИЕ паттерны в ошибках бота и перепиши правила через НАМЕРЕНИЕ автора "
+            "(продажа, вербовка, реклама), а не ключевые слова. Убери дубли и избыточные "
+            "детали. Не вставляй конкретные тексты сообщений — только обобщения вида "
+            "«короткие рекламные призывы с глаголами действия». Сохрани исключения для NOT_SPAM."
         ),
     },
     {
@@ -1093,6 +1114,15 @@ async def auto_improve_prompt(trigger_error_type: str, trigger_message: str):
                 "attempt": i,
             })
 
+            # EARLY-STOP: если кандидат уже net-positive и точность выросла —
+            # применяем сразу, не тратим деньги на оставшиеся стратегии
+            if fixes - regressions > 0 and new_acc > current_acc:
+                await _send_progress(
+                    f"⚡ Попытка {i} дала net-positive результат — применяю сразу "
+                    f"(оставшиеся стратегии пропущены для экономии)"
+                )
+                break
+
             # Запомним для следующих попыток
             failed_attempts.append((strategy['name'], new_acc, analysis[:120] if analysis else ""))
 
@@ -1357,13 +1387,20 @@ async def send_to_admin(message: types.Message, result: SpamResult, reasoning: s
         logger.error(f"Ошибка отправки админу: {e}")
 
 
-async def ban_and_report(message: types.Message, result: SpamResult, reasoning: str = ""):
+async def ban_and_report(message: types.Message, result: SpamResult, reasoning: str = "", force: bool = False):
+    """Бан + удаление + отчёт админу.
+
+    force=True: банить даже пользователя со старой активностью.
+    Нужно для edit-to-spam — спамер специально пишет невинное сообщение,
+    выжидает и редактирует его в спам; защита «старая активность» иначе
+    блокирует бан именно в этом сценарии.
+    """
     uid, cid = message.from_user.id, message.chat.id
 
     if message.sender_chat:
         await send_to_admin(message, result, reasoning)
         return
-    if db.has_user_old_activity(uid, cid, 10):
+    if not force and db.has_user_old_activity(uid, cid, 10):
         await send_to_admin(message, result, reasoning)
         return
 
@@ -1773,15 +1810,30 @@ async def handle_message(message: types.Message):
 
     is_cas_banned = await check_cas_ban(uid)
 
-    # Для новых пользователей — проверяем профиль (bio + личный канал)
-    profile_spam_signal = ""
-    if user_msg_count <= 2:
-        profile_spam_signal = await check_user_profile(uid)
-        if profile_spam_signal:
-            logger.info(f"👤 Profile check @{username}: {profile_spam_signal[:100]}")
+    # ── Сбор сигналов риска: [(описание, 'strong'|'weak'), ...] ──
+    risk_signals = []
 
-    # Пересланное сообщение — повышенная подозрительность
-    if is_forward:
+    # CAS + нет истории → автобан без LLM
+    if is_cas_banned and user_msg_count == 0:
+        logger.info(f"🚫 CAS-BAN @{username} (cas=True, msgs=0) | {message.chat.title} | «{text_preview}»")
+        try:
+            db.save_message(message.message_id, cid, uid, message.from_user.username or '', msg_text, "СПАМ")
+        except Exception:
+            pass
+        await ban_and_report(message, SpamResult.SPAM, "Пользователь в CAS-базе спамеров, нет истории в группе")
+        return
+    if is_cas_banned:
+        risk_signals.append(("CAS-бан", 'strong'))
+
+    # Профиль нового пользователя (bio + личный канал)
+    if user_msg_count <= 2:
+        profile_signal = await check_user_profile(uid)
+        if profile_signal:
+            risk_signals.append((profile_signal, 'weak'))
+            logger.info(f"👤 Profile check @{username}: {profile_signal[:100]}")
+
+    # Пересланное сообщение от нового пользователя
+    if is_forward and user_msg_count <= 2:
         forward_source = ""
         if message.forward_from_chat:
             forward_source = f"Переслано из канала «{message.forward_from_chat.title}»"
@@ -1790,28 +1842,18 @@ async def handle_message(message: types.Message):
         elif message.forward_sender_name:
             forward_source = f"Переслано от {message.forward_sender_name}"
         if forward_source:
-            profile_spam_signal = f"{profile_spam_signal}; {forward_source}" if profile_spam_signal else forward_source
+            risk_signals.append((forward_source, 'weak'))
             logger.info(f"📨 Forward from new user @{username}: {forward_source}")
 
-    # Документ от нового пользователя — сильный сигнал спама
-    # (HTML, exe, apk, zip от незнакомого аккаунта почти всегда вредонос)
+    # Опасный документ от нового пользователя — сильный сигнал
+    # (HTML/exe/apk/zip от незнакомого аккаунта почти всегда вредонос)
     if has_document and user_msg_count <= 2:
         suspicious_exts = ('.html', '.htm', '.exe', '.apk', '.zip', '.rar', '.bat', '.scr', '.js')
         fname = (message.document.file_name or '').lower()
         if any(fname.endswith(ext) for ext in suspicious_exts):
-            doc_signal = f"Документ '{message.document.file_name}' от нового пользователя"
-            profile_spam_signal = f"{profile_spam_signal}; {doc_signal}" if profile_spam_signal else doc_signal
+            doc_signal = f"Опасный документ '{message.document.file_name}' от нового пользователя"
+            risk_signals.append((doc_signal, 'strong'))
             logger.info(f"📎 Suspicious document from @{username}: {doc_signal}")
-
-    # CAS + нет истории → автобан
-    if is_cas_banned and user_msg_count == 0:
-        logger.info(f"🚫 CAS-BAN @{username} (cas=True, msgs=0) | {message.chat.title} | «{text_preview}»")
-        try:
-            db.save_message(message.message_id, cid, uid, message.from_user.username or '', msg_text, "СПАМ")
-        except Exception:
-            pass
-        await ban_and_report(message, SpamResult.SPAM)
-        return
 
     # Получаем URL фото если есть
     photo_url = None
@@ -1825,10 +1867,16 @@ async def handle_message(message: types.Message):
         except Exception as e:
             logger.error(f"Ошибка получения фото: {e}")
 
-    result, reasoning = await check_message_with_llm(msg_text, uid, user_msg_count, is_cas_banned, photo_url, profile_spam_signal)
+    # LLM-классификация: сигналы передаются как информационный контекст
+    context_note = "; ".join(s for s, _ in risk_signals)
+    result, reasoning = await check_message_with_llm(msg_text, uid, user_msg_count, is_cas_banned, photo_url, context_note)
+
+    # Эскалация по совокупности сигналов (MAYBE+strong→SPAM и т.д.)
+    result, reasoning = apply_risk_escalation(result, reasoning, risk_signals)
+
     emoji = {"СПАМ": "🔴", "ВОЗМОЖНО_СПАМ": "🟡", "НЕ_СПАМ": "🟢"}[result.value]
     source = "Vision" if photo_url else "LLM"
-    logger.info(f"{emoji} {source}→{result.value} @{username} (msgs={user_msg_count}, cas={is_cas_banned}) | {message.chat.title} | «{text_preview}» | reason: {reasoning[:100]}")
+    logger.info(f"{emoji} {source}→{result.value} @{username} (msgs={user_msg_count}, cas={is_cas_banned}, signals={len(risk_signals)}) | {message.chat.title} | «{text_preview}» | reason: {reasoning[:100]}")
 
     try:
         db.save_message(message.message_id, cid, uid, message.from_user.username or '', msg_text, result.value, reasoning)
@@ -1940,7 +1988,8 @@ async def handle_edited_message(message: types.Message):
 
     if became_spam and was_clean:
         # Классический edit-to-spam — реагируем жёстко
-        await ban_and_report(message, result, f"[EDIT-TO-SPAM] {reasoning}")
+        # force=True: «старая активность» не должна спасать edit-to-spam спамера
+        await ban_and_report(message, result, f"[EDIT-TO-SPAM] {reasoning}", force=True)
     elif became_spam:
         # Был подозрительный, теперь СПАМ — тоже бан
         await ban_and_report(message, result, f"[EDIT] {reasoning}")

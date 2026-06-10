@@ -74,16 +74,11 @@ AUTO_IMPROVE_COOLDOWN_MINUTES = int(os.getenv("AUTO_IMPROVE_COOLDOWN_MINUTES", "
 MIN_VALIDATION_EXAMPLES = int(os.getenv("MIN_VALIDATION_EXAMPLES", "10"))
 # Максимум spam-примеров для валидации
 MAX_VALIDATION_EXAMPLES = int(os.getenv("MAX_VALIDATION_EXAMPLES", "200"))
-# Сколько admin-reviewed правильных примеров включать в валидацию
-REGRESSION_CHECK_SAMPLES = int(os.getenv("REGRESSION_CHECK_SAMPLES", "50"))
-# Сколько обычных сообщений (без подозрений) включать в валидацию
+# База для размера валидационного датасета (умножается на 4 в get_validation_dataset)
 ORDINARY_MESSAGES_SAMPLES = int(os.getenv("ORDINARY_MESSAGES_SAMPLES", "300"))
-# Сколько попыток улучшить промпт за один цикл (каждая — вызов LLM)
-MAX_IMPROVEMENT_ATTEMPTS = int(os.getenv("MAX_IMPROVEMENT_ATTEMPTS", "5"))
-# Минимальный прирост точности для применения нового промпта (5%)
-MIN_ACCURACY_GAIN = float(os.getenv("MIN_ACCURACY_GAIN", "0.05"))
-# Максимум регрессий (раньше правильно → теперь неправильно)
-MAX_REGRESSIONS = int(os.getenv("MAX_REGRESSIONS", "3"))
+# Сколько попыток улучшить промпт за один цикл (каждая — вызов LLM).
+# Цикл останавливается раньше при первом net-positive кандидате (early-stop).
+MAX_IMPROVEMENT_ATTEMPTS = int(os.getenv("MAX_IMPROVEMENT_ATTEMPTS", "3"))
 
 # Логирование
 LOG_LEVEL = "INFO"
