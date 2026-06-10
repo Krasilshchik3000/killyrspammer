@@ -1362,6 +1362,30 @@ async def delete_user_messages(user_id: int) -> int:
     return deleted
 
 
+async def _finalize_admin_message(admin_msg: types.Message, verdict_line: str):
+    """Дописывает вердикт в сообщение-уведомление админа и убирает кнопки.
+
+    Работает и для текстовых сообщений (edit_text), и для фото-уведомлений
+    (edit_caption) — у медиа текст лежит в caption, edit_text для них падает.
+    Если редактирование не удалось — хотя бы убираем кнопки, чтобы не висели.
+    """
+    # admin_msg.text/caption — уже отрендеренный текст без разметки;
+    # экранируем, чтобы < > & из пользовательского сообщения не ломали HTML parse
+    base = html.escape(admin_msg.text or admin_msg.caption or "")
+    new_content = f"{base}{verdict_line}"
+    try:
+        if admin_msg.caption is not None:
+            await admin_msg.edit_caption(caption=new_content, parse_mode='HTML')
+        else:
+            await admin_msg.edit_text(new_content, parse_mode='HTML')
+    except Exception as e:
+        logger.warning(f"Не удалось дописать вердикт в уведомление: {e}")
+        try:
+            await admin_msg.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
 async def send_to_admin(message: types.Message, result: SpamResult, reasoning: str = ""):
     emoji = "🔴" if result == SpamResult.SPAM else "🟡"
     reasoning_line = f"\n\n💭 <i>{html.escape(reasoning[:200])}</i>" if reasoning else ""
@@ -2051,11 +2075,8 @@ async def handle_admin_feedback(callback: types.CallbackQuery):
 
     emoji = "❌" if is_spam else "✅"
     reasoning_line = f"\n💭 Бот думал: {html.escape(reasoning[:150])}" if reasoning else ""
-    new_text = f"{callback.message.text}\n\n{emoji} <b>Решение: {decision}</b>{ban_info}{reasoning_line}"
-    try:
-        await callback.message.edit_text(new_text, parse_mode='HTML')
-    except Exception:
-        pass
+    verdict_line = f"\n\n{emoji} <b>Решение: {decision}</b>{ban_info}{reasoning_line}"
+    await _finalize_admin_message(callback.message, verdict_line)
 
     # Определяем тип ошибки и запускаем автоулучшение
     error_type = None
@@ -2093,8 +2114,7 @@ async def handle_unban(callback: types.CallbackQuery):
         await unban_user_in_all_groups(user_id)
         await callback.answer("✅ Разбанен")
 
-        new_text = f"{callback.message.text}\n\n🟢 <b>РАЗБАНЕН</b>"
-        await callback.message.edit_text(new_text, parse_mode='HTML')
+        await _finalize_admin_message(callback.message, "\n\n🟢 <b>РАЗБАНЕН</b>")
 
         row = db.get_message_by_id(orig_msg_id)
         if row:
