@@ -1816,6 +1816,43 @@ async def handle_admin_text(message: types.Message):
 
 
 # ──────────────────────────────────────────────
+# Сервисные сообщения: «X вошёл в группу» / «X вышел» — удаляем.
+# Зарегистрирован ДО основного обработчика — aiogram отдаёт сообщение
+# первому подходящему хендлеру.
+# ──────────────────────────────────────────────
+
+@dp.message(F.new_chat_members | F.left_chat_member)
+async def handle_service_messages(message: types.Message):
+    if message.chat.id not in ALLOWED_GROUP_IDS:
+        return
+
+    # Бонус: новых участников сразу проверяем по базам спамеров.
+    # Известный спамер банится ДО того, как успеет что-то написать.
+    for member in (message.new_chat_members or []):
+        if member.is_bot:
+            continue
+        try:
+            in_db, db_name = await check_spam_databases(member.id)
+            if in_db:
+                await bot.ban_chat_member(chat_id=message.chat.id, user_id=member.id)
+                banned, _ = await ban_user_in_all_groups(member.id, exclude_chat_id=message.chat.id)
+                logger.info(f"🚫 JOIN-BAN {member.full_name} ({db_name}) | {message.chat.title}")
+                await _send_progress(
+                    f"🚫 <b>Бан при входе</b>: {html.escape(member.full_name)} "
+                    f"(база {db_name}) — {html.escape(message.chat.title or '')}, "
+                    f"забанен в {len(banned) + 1} группах"
+                )
+        except Exception as e:
+            logger.warning(f"Ошибка проверки нового участника {member.id}: {e}")
+
+    # Удаляем само сервисное сообщение («вошёл»/«вышел»)
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"Не удалось удалить сервисное сообщение: {e}")
+
+
+# ──────────────────────────────────────────────
 # Основной обработчик сообщений
 # ──────────────────────────────────────────────
 
