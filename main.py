@@ -142,6 +142,38 @@ def _temperature_param(model: str, value: float) -> dict:
     return {"temperature": value}
 
 
+def get_forward_info(message: types.Message) -> dict:
+    """Единая точка чтения forward-данных через Bot API 7.0+ forward_origin.
+
+    Возвращает {is_forward, user_id, username, chat_title, description}.
+    user_id есть только если оригинал от видимого пользователя (MessageOriginUser);
+    скрытые пользователи (privacy) дают только имя, каналы — title.
+    """
+    origin = getattr(message, 'forward_origin', None)
+    info = {"is_forward": bool(origin), "user_id": None, "username": None,
+            "chat_title": None, "description": ""}
+    if not origin:
+        return info
+    ot = getattr(origin, 'type', '')
+    if ot == 'user' and getattr(origin, 'sender_user', None):
+        u = origin.sender_user
+        info["user_id"] = u.id
+        info["username"] = u.username or u.full_name
+        info["description"] = f"Переслано от {u.full_name}"
+    elif ot == 'hidden_user':
+        info["username"] = getattr(origin, 'sender_user_name', None)
+        info["description"] = f"Переслано от {info['username']}"
+    elif ot == 'channel' and getattr(origin, 'chat', None):
+        info["chat_title"] = origin.chat.title
+        info["username"] = origin.chat.title
+        info["description"] = f"Переслано из канала «{origin.chat.title}»"
+    elif ot == 'chat' and getattr(origin, 'sender_chat', None):
+        info["chat_title"] = origin.sender_chat.title
+        info["username"] = origin.sender_chat.title
+        info["description"] = f"Переслано из чата «{origin.sender_chat.title}»"
+    return info
+
+
 def _reasoning_effort_param(model: str) -> dict:
     """Для reasoning-моделей (gpt-5.x) ограничиваем 'размышления' на классификации:
     low = быстрее, дешевле, меньше шансов выжечь max_completion_tokens reasoning-токенами."""
@@ -270,53 +302,56 @@ async def check_cas_ban(user_id: int) -> bool:
         return False
 
 
+async def check_lols_ban(user_id: int) -> bool:
+    """lols.bot — вторая бесплатная база спамеров (крупнее и быстрее обновляется, чем CAS)."""
+    try:
+        response = await _http_client.get(
+            "https://api.lols.bot/account", params={"id": user_id}, timeout=5
+        )
+        data = response.json()
+        return bool(data.get("banned", False))
+    except Exception:
+        return False
+
+
+async def check_spam_databases(user_id: int) -> tuple[bool, str]:
+    """Параллельная проверка по CAS и lols.bot. Возвращает (в_базе, название_базы)."""
+    cas, lols = await asyncio.gather(check_cas_ban(user_id), check_lols_ban(user_id))
+    if cas and lols:
+        return True, "CAS+lols.bot"
+    if cas:
+        return True, "CAS"
+    if lols:
+        return True, "lols.bot"
+    return False, ""
+
+
 async def check_user_profile(user_id: int) -> str:
-    """Проверяет профиль пользователя на спам-сигналы через raw Bot API.
+    """Проверяет профиль пользователя на спам-сигналы (bio + личный канал).
 
-    Использует httpx напрямую (а не aiogram) чтобы получить поля
-    personal_chat и другие, которые aiogram 3.4.1 не поддерживает.
-
+    aiogram 3.28+ нативно отдаёт personal_chat (Bot API 7.2+).
     Возвращает описание подозрительного контента или пустую строку.
     """
     try:
-        response = await _http_client.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
-            params={"chat_id": user_id},
-            timeout=5,
-        )
-        data = response.json()
-        if not data.get("ok"):
-            return ""
-        chat = data["result"]
+        chat = await bot.get_chat(user_id)
     except Exception:
         return ""
 
-    signals = []
     profile_parts = []  # Для LLM-анализа
 
-    # Bio
-    bio = chat.get("bio", "")
+    bio = getattr(chat, 'bio', None)
     if bio:
         profile_parts.append(f"Bio: {bio}")
 
     # Привязанный личный канал (Bot API 7.2+)
-    personal_chat = chat.get("personal_chat")
+    personal_chat = getattr(chat, 'personal_chat', None)
     if personal_chat:
-        channel_title = personal_chat.get("title", "")
-        profile_parts.append(f"Личный канал: {channel_title}")
-
-        # Получаем описание канала
+        profile_parts.append(f"Личный канал: {personal_chat.title}")
         try:
-            ch_resp = await _http_client.get(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
-                params={"chat_id": personal_chat["id"]},
-                timeout=5,
-            )
-            ch_data = ch_resp.json()
-            if ch_data.get("ok"):
-                ch_desc = ch_data["result"].get("description", "")
-                if ch_desc:
-                    profile_parts.append(f"Описание канала: {ch_desc}")
+            ch_info = await bot.get_chat(personal_chat.id)
+            ch_desc = getattr(ch_info, 'description', None)
+            if ch_desc:
+                profile_parts.append(f"Описание канала: {ch_desc}")
         except Exception:
             pass
 
@@ -388,28 +423,16 @@ def _classify_spam_type(text: str) -> str:
 
 
 async def _get_profile_data(user_id: int) -> dict:
-    """Получить bio и канал пользователя через raw Bot API."""
+    """Получить bio и личный канал пользователя (для архива забаненных)."""
     try:
-        response = await _http_client.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
-            params={"chat_id": user_id}, timeout=5,
-        )
-        data = response.json()
-        if not data.get("ok"):
-            return {}
-        chat = data["result"]
-        result = {"bio": chat.get("bio", "")}
-        personal_chat = chat.get("personal_chat")
+        chat = await bot.get_chat(user_id)
+        result = {"bio": getattr(chat, 'bio', None) or ""}
+        personal_chat = getattr(chat, 'personal_chat', None)
         if personal_chat:
-            result["channel_title"] = personal_chat.get("title", "")
+            result["channel_title"] = personal_chat.title or ""
             try:
-                ch_resp = await _http_client.get(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
-                    params={"chat_id": personal_chat["id"]}, timeout=5,
-                )
-                ch_data = ch_resp.json()
-                if ch_data.get("ok"):
-                    result["channel_desc"] = ch_data["result"].get("description", "")
+                ch_info = await bot.get_chat(personal_chat.id)
+                result["channel_desc"] = getattr(ch_info, 'description', None) or ""
             except Exception:
                 pass
         return result
@@ -1492,19 +1515,12 @@ async def ban_and_report(message: types.Message, result: SpamResult, reasoning: 
 # Пересланные сообщения от админа = спам
 # ──────────────────────────────────────────────
 
-@dp.message(F.chat.type == "private", F.forward_date)
+@dp.message(F.chat.type == "private", F.forward_origin)
 @require_admin
 async def handle_forwarded_spam(message: types.Message):
-    original_user_id = None
-    original_username = None
-
-    if message.forward_from:
-        original_user_id = message.forward_from.id
-        original_username = message.forward_from.username or message.forward_from.full_name
-    elif message.forward_sender_name:
-        original_username = message.forward_sender_name
-    elif message.forward_from_chat:
-        original_username = message.forward_from_chat.title
+    fwd = get_forward_info(message)
+    original_user_id = fwd["user_id"]
+    original_username = fwd["username"]
 
     spam_text = message.text or message.caption or ""
     if spam_text:
@@ -1822,10 +1838,12 @@ async def handle_message(message: types.Message):
     text_preview = msg_text[:80].replace('\n', ' ')
     user_msg_count = db.count_user_messages(uid, cid)
 
-    # Пользователь с историей сообщений — доверенный, не проверяем через LLM
-    # ИСКЛЮЧЕНИЕ: пересланные сообщения всегда проверяются (VPN-спам паттерн)
-    is_forward = bool(message.forward_date)
-    if user_msg_count >= TRUSTED_USER_MESSAGES and not is_forward:
+    # Пользователь с историей ОСМЫСЛЕННЫХ сообщений — доверенный, без LLM.
+    # Однословные пробы («привет», «+») не учитываются — спамеры так
+    # прокачивают доверие. ИСКЛЮЧЕНИЕ: forwards всегда проверяются.
+    meaningful_count = db.count_meaningful_user_messages(uid, cid)
+    is_forward = bool(getattr(message, 'forward_origin', None))
+    if meaningful_count >= TRUSTED_USER_MESSAGES and not is_forward:
         logger.info(f"✅ TRUSTED @{username} (msgs={user_msg_count}) | {message.chat.title} | «{text_preview}»")
         try:
             db.save_message(message.message_id, cid, uid, message.from_user.username or '', msg_text, "НЕ_СПАМ")
@@ -1842,22 +1860,35 @@ async def handle_message(message: types.Message):
     if not msg_text and not has_photo and not has_document:
         return
 
-    is_cas_banned = await check_cas_ban(uid)
+    # FINGERPRINT: точное совпадение с подтверждённым спамом → мгновенный бан
+    # без затрат на LLM (спам-кампании репостят текст дословно)
+    if msg_text and len(msg_text) >= 25 and db.is_known_spam_text(msg_text):
+        logger.info(f"🎯 FINGERPRINT-BAN @{username} | {message.chat.title} | «{text_preview}»")
+        try:
+            db.save_message(message.message_id, cid, uid, message.from_user.username or '', msg_text, "СПАМ",
+                            "Точное совпадение с подтверждённым спамом")
+        except Exception:
+            pass
+        await ban_and_report(message, SpamResult.SPAM, "Точное совпадение с подтверждённым спамом (fingerprint)")
+        return
+
+    in_spam_db, db_name = await check_spam_databases(uid)
+    is_cas_banned = in_spam_db  # для контекста LLM
 
     # ── Сбор сигналов риска: [(описание, 'strong'|'weak'), ...] ──
     risk_signals = []
 
-    # CAS + нет истории → автобан без LLM
-    if is_cas_banned and user_msg_count == 0:
-        logger.info(f"🚫 CAS-BAN @{username} (cas=True, msgs=0) | {message.chat.title} | «{text_preview}»")
+    # Спам-база + нет истории → автобан без LLM
+    if in_spam_db and user_msg_count == 0:
+        logger.info(f"🚫 DB-BAN @{username} ({db_name}, msgs=0) | {message.chat.title} | «{text_preview}»")
         try:
             db.save_message(message.message_id, cid, uid, message.from_user.username or '', msg_text, "СПАМ")
         except Exception:
             pass
-        await ban_and_report(message, SpamResult.SPAM, "Пользователь в CAS-базе спамеров, нет истории в группе")
+        await ban_and_report(message, SpamResult.SPAM, f"Пользователь в базе спамеров {db_name}, нет истории в группе")
         return
-    if is_cas_banned:
-        risk_signals.append(("CAS-бан", 'strong'))
+    if in_spam_db:
+        risk_signals.append((f"в базе спамеров {db_name}", 'strong'))
 
     # Профиль нового пользователя (bio + личный канал)
     if user_msg_count <= 2:
@@ -1868,13 +1899,7 @@ async def handle_message(message: types.Message):
 
     # Пересланное сообщение от нового пользователя
     if is_forward and user_msg_count <= 2:
-        forward_source = ""
-        if message.forward_from_chat:
-            forward_source = f"Переслано из канала «{message.forward_from_chat.title}»"
-        elif message.forward_from:
-            forward_source = f"Переслано от {message.forward_from.full_name}"
-        elif message.forward_sender_name:
-            forward_source = f"Переслано от {message.forward_sender_name}"
+        forward_source = get_forward_info(message)["description"]
         if forward_source:
             risk_signals.append((forward_source, 'weak'))
             logger.info(f"📨 Forward from new user @{username}: {forward_source}")
@@ -2151,7 +2176,14 @@ async def main():
         return
 
     bot = Bot(token=BOT_TOKEN)
-    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    # LLM_BASE_URL позволяет подключить любой OpenAI-совместимый провайдер:
+    # Gemini (https://generativelanguage.googleapis.com/v1beta/openai/),
+    # DeepSeek, Mistral и т.д. + LLM_API_KEY для их ключа.
+    _base_url = os.getenv("LLM_BASE_URL") or None
+    _api_key = os.getenv("LLM_API_KEY") or OPENAI_API_KEY
+    openai_client = AsyncOpenAI(api_key=_api_key, base_url=_base_url)
+    if _base_url:
+        logger.info(f"LLM провайдер: {_base_url}")
     _http_client = httpx.AsyncClient()
 
     db.init_database()

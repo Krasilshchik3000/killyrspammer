@@ -217,3 +217,29 @@ class TestBotState:
         awaiting, pending = db.get_bot_state(999999)
         assert awaiting is False
         assert pending is None
+
+
+class TestFingerprint:
+    def test_known_spam_from_training(self):
+        db.add_training_example("Зарабатывай 500$ в день, пиши в лс", True, "test")
+        assert db.is_known_spam_text("Зарабатывай 500$ в день, пиши в лс") is True
+        assert db.is_known_spam_text("обычное сообщение") is False
+
+    def test_known_spam_from_autobanned(self):
+        db.save_message(501, -100123, 999, "spammer", "Куплю ваш аккаунт дорого", "СПАМ")
+        assert db.is_known_spam_text("Куплю ваш аккаунт дорого") is True
+
+    def test_not_spam_decision_not_fingerprinted(self):
+        """Если админ сказал НЕ_СПАМ — текст не считается спам-отпечатком."""
+        db.save_message(502, -100123, 998, "user", "Продам велосипед недорого", "СПАМ")
+        db.update_admin_decision(502, "НЕ_СПАМ")
+        assert db.is_known_spam_text("Продам велосипед недорого") is False
+
+
+class TestMeaningfulCount:
+    def test_short_messages_not_counted(self):
+        """Однословные пробы не прокачивают trust."""
+        for i, text in enumerate(["привет", "+", "👍", "Развёрнутое осмысленное сообщение о жизни", "Ещё одно длинное сообщение про погоду"]):
+            db.save_message(600 + i, -100200, 777, "u", text, "НЕ_СПАМ")
+        assert db.count_user_messages(777, -100200) == 5
+        assert db.count_meaningful_user_messages(777, -100200) == 2

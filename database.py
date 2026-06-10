@@ -467,6 +467,41 @@ def get_user_messages(user_id: int, limit=100):
     ) or []
 
 
+def is_known_spam_text(text: str) -> bool:
+    """Точное совпадение с подтверждённым спамом (fingerprint pre-check).
+
+    Источники: training_examples (is_spam) и messages, где спам подтверждён
+    (admin_decision='СПАМ' либо автобан без оспаривания).
+    """
+    row = execute_query(
+        "SELECT 1 FROM training_examples WHERE is_spam = ? AND text = ? LIMIT 1",
+        (True, text), fetch='one'
+    )
+    if row:
+        return True
+    row = execute_query(
+        """SELECT 1 FROM messages WHERE text = ?
+           AND (admin_decision = 'СПАМ'
+                OR (llm_result = 'СПАМ' AND admin_decision IS NULL))
+           LIMIT 1""",
+        (text,), fetch='one'
+    )
+    return row is not None
+
+
+def count_meaningful_user_messages(user_id: int, chat_id: int, min_len: int = 10) -> int:
+    """Счётчик ОСМЫСЛЕННЫХ сообщений для trust-статуса.
+
+    Спамеры «прокачивают» доверие однословными пробами («привет», «+», «👍»).
+    Сообщения короче min_len символов не учитываются.
+    """
+    row = execute_query(
+        "SELECT COUNT(*) FROM messages WHERE user_id = ? AND chat_id = ? AND LENGTH(text) >= ?",
+        (user_id, chat_id, min_len), fetch='one'
+    )
+    return row[0] if row else 0
+
+
 def find_user_by_message_text(text: str):
     """Найти user_id по точному тексту сообщения (для forwarded spam без user_id)."""
     row = execute_query(
