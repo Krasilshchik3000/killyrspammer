@@ -32,7 +32,7 @@ from config import (
     FEW_SHOT_EXAMPLES_COUNT, CAS_API_URL, TRUSTED_USER_MESSAGES,
     AUTO_IMPROVE_AFTER_ERRORS, AUTO_IMPROVE_COOLDOWN_MINUTES,
     MIN_VALIDATION_EXAMPLES, MAX_VALIDATION_EXAMPLES,
-    MAX_IMPROVEMENT_ATTEMPTS, ORDINARY_MESSAGES_SAMPLES,
+    MAX_IMPROVEMENT_ATTEMPTS, ORDINARY_MESSAGES_SAMPLES, LLM_REASONING_EFFORT,
 )
 from config import LLM_MODEL as _ENV_LLM_MODEL
 from config import LLM_IMPROVEMENT_MODEL as _ENV_LLM_IMPROVEMENT_MODEL
@@ -140,6 +140,14 @@ def _temperature_param(model: str, value: float) -> dict:
     if _is_reasoning_model(model):
         return {}
     return {"temperature": value}
+
+
+def _reasoning_effort_param(model: str) -> dict:
+    """Для reasoning-моделей (gpt-5.x) ограничиваем 'размышления' на классификации:
+    low = быстрее, дешевле, меньше шансов выжечь max_completion_tokens reasoning-токенами."""
+    if _is_reasoning_model(model) and model.startswith("gpt-5"):
+        return {"reasoning_effort": LLM_REASONING_EFFORT}
+    return {}
 
 
 class SpamResult(Enum):
@@ -494,6 +502,7 @@ async def classify_message(
         response_format=CLASSIFICATION_SCHEMA,
         **_token_limit_param(LLM_MAX_TOKENS),
         **_temperature_param(LLM_MODEL, LLM_TEMPERATURE),
+        **_reasoning_effort_param(LLM_MODEL),
         timeout=LLM_TIMEOUT,
     )
     raw = response.choices[0].message.content.strip()
@@ -562,6 +571,7 @@ async def classify_image(
         response_format=CLASSIFICATION_SCHEMA,
         **_token_limit_param(LLM_MAX_TOKENS),
         **_temperature_param(LLM_MODEL, LLM_TEMPERATURE),
+        **_reasoning_effort_param(LLM_MODEL),
         timeout=LLM_TIMEOUT,
     )
     raw = response.choices[0].message.content.strip()
@@ -2209,7 +2219,10 @@ async def main():
         else:
             report_lines.append("  • ❌ Не найдена рабочая модель улучшения!")
         if detection["errors"]:
-            report_lines.append(f"\n<i>Проверено моделей: {len(detection['errors'])} не работают</i>")
+            failed_names = ", ".join(e.split(":")[0] for e in detection["errors"])
+            report_lines.append(
+                f"\n<i>Недоступны на этом ключе (пропущены при подборе): {html.escape(failed_names)}</i>"
+            )
         await bot.send_message(ADMIN_ID, "\n".join(report_lines), parse_mode='HTML')
     except Exception as e:
         logger.warning(f"Не удалось отправить startup-отчёт: {e}")
